@@ -1,0 +1,7 @@
+# Requirements for Pushup Data Collector GUI
+bleak>=0.21.0
+matplotlib>=3.7.0
+numpy>=1.24.0
+seaborn
+tensorflow
+scikit-learn
