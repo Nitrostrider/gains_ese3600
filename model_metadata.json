@@ -1,0 +1,17 @@
+{
+  "phase_classes": [
+    "moving-down",
+    "moving-up",
+    "not-in-pushup",
+    "top"
+  ],
+  "posture_classes": [
+    "good-form",
+    "hips-sagging"
+  ],
+  "window_size": 100,
+  "stride": 25,
+  "sampling_rate": 100,
+  "num_phase_classes": 4,
+  "num_posture_classes": 2
+}
