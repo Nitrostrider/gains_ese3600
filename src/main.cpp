@@ -20,9 +20,6 @@
 #include "imu_provider.h"
 #include "pushup_model_data.h"
 
-// I2C scanner for debugging
-void scan_i2c_bus();
-
 /* Pins on the Seeed Studio XIAO are labeled incorrectly.
    Pin 'n' here refers to pin 'n-1' on the board. Pins 5 and 6 cannot be used since
    they are I2C pins between the ESP-32 Microcontroller and the OLED display */
@@ -308,10 +305,6 @@ void setup() {
     pinMode(ledPin, OUTPUT);
     pinMode(buttonPin, INPUT);
     attachInterrupt(digitalPinToInterrupt(buttonPin), handleButtonInterrupt, CHANGE);
-
-    // DEBUG: Scan I2C bus to find connected devices
-    Serial.println("\n--- Scanning I2C bus ---");
-    scan_i2c_bus();
 
     // Initialize IMU
     if (!SetupIMU()) {

@@ -1,7 +1,5 @@
 #include <Arduino.h>
 #include <Wire.h>
-#include <NimBLEDevice.h>
-#include <NimBLEAdvertisementData.h>
 
 // ---------- I2C pins & ICM20600 config ----------
 #define I2C_SDA 5     // working pins for your Xiao ESP32S3
@@ -18,14 +16,8 @@
 static const float ACC_LSB_PER_G   = 16384.0f; // ±2g
 static const float GYR_LSB_PER_DPS = 131.0f;   // ±250 dps
 
-// ---------- BLE UUIDs required by HTML ----------
-static const NimBLEUUID SVC_UUID ((uint16_t)0xFF00);
-static const NimBLEUUID IMU_UUID ((uint16_t)0xFF01);  // notify
-static const NimBLEUUID CTRL_UUID((uint16_t)0xFF02);  // write
-
 // ---------- Globals ----------
-NimBLECharacteristic* imuChar = nullptr;
-volatile bool streamOn = true;        // toggled by control writes
+volatile bool streamOn = false;        // toggled by serial commands
 const uint32_t PERIOD_MS = 25;         // ~40 Hz
 
 // ---------- I2C helpers ----------
@@ -79,32 +71,12 @@ static bool icmRead(float& ax,float& ay,float& az,
   return true;
 }
 
-// ---------- BLE callbacks ----------
-class CbServer : public NimBLEServerCallbacks {
-  void onConnect(NimBLEServer*) {
-    Serial.println("[BLE] Central connected");
-  }
-  void onDisconnect(NimBLEServer*) {
-    Serial.println("[BLE] Central disconnected");
-    NimBLEDevice::startAdvertising();
-  }
-};
-
-// no 'override' → works with more NimBLE versions
-class CbCtrl : public NimBLECharacteristicCallbacks {
-  void onWrite(NimBLECharacteristic* c) {
-    auto v = c->getValue();
-    if (v.size() > 0) {
-      streamOn = (v[0] != 0);  // 0x01 = start, 0x00 = stop
-      Serial.printf("[CTRL] streamOn = %d\n", streamOn ? 1 : 0);
-    }
-  }
-};
-
 void setup() {
   Serial.begin(115200);
-  for (int i = 0; i < 60 && !Serial; i++) delay(20);
-  Serial.println("\n[BOOT] GAINS Pushup IMU Data Collector");
+  delay(1000);
+  Serial.println("\n[BOOT] GAINS Pushup IMU Data Collector (Serial Mode)");
+  Serial.println("Commands: START (begin streaming), STOP (end streaming)");
+  Serial.println("Waiting for commands...\n");
 
   // I2C + IMU
   Wire.begin(I2C_SDA, I2C_SCL, 400000);
@@ -116,37 +88,25 @@ void setup() {
     Serial.println("[I2C] ICM init FAILED");
   }
 
-  // BLE setup
-  NimBLEDevice::init("GAINS-Pushup");
-  NimBLEDevice::setMTU(128);             // IMPORTANT for 36-byte packets
-  NimBLEDevice::setPower(ESP_PWR_LVL_P9);
-  NimBLEDevice::setSecurityAuth(false,false,false);
-
-  auto server = NimBLEDevice::createServer();
-  server->setCallbacks(new CbServer());
-
-  auto svc = server->createService(SVC_UUID);
-  imuChar = svc->createCharacteristic(
-      IMU_UUID, NIMBLE_PROPERTY::NOTIFY
-  );
-  auto ctrl = svc->createCharacteristic(
-      CTRL_UUID, NIMBLE_PROPERTY::WRITE
-  );
-  ctrl->setCallbacks(new CbCtrl());
-  svc->start();
-
-  auto adv = NimBLEDevice::getAdvertising();
-  adv->addServiceUUID(SVC_UUID);
-  NimBLEAdvertisementData scanResp;
-  scanResp.setName("GAINS-Pushup");
-  adv->setScanResponseData(scanResp);
-  adv->setName("GAINS-Pushup");
-  adv->start();
-  Serial.println("[BLE] Advertising as GAINS-Pushup with svc 0xFF00");
+  Serial.println("[READY] Send START to begin streaming IMU data");
 }
 
 void loop() {
   static uint32_t last = 0;
+
+  // Check for serial commands
+  if (Serial.available() > 0) {
+    String cmd = Serial.readStringUntil('\n');
+    cmd.trim();
+
+    if (cmd == "START") {
+      streamOn = true;
+      Serial.println("[CMD] Streaming STARTED");
+    } else if (cmd == "STOP") {
+      streamOn = false;
+      Serial.println("[CMD] Streaming STOPPED");
+    }
+  }
 
   if (!streamOn) {
     delay(5);
@@ -163,9 +123,12 @@ void loop() {
   float ax, ay, az, gx, gy, gz;
   if (!icmRead(ax, ay, az, gx, gy, gz)) return;
 
-  // 9 float32 little-endian payload: ax..gz + mx,my,mz (mag set to 0 here)
-  float mx = 0, my = 0, mz = 0;
-  float vals[9] = { ax, ay, az, gx, gy, gz, mx, my, mz };
-  imuChar->setValue((uint8_t*)vals, sizeof(vals));  // 36 bytes
-  imuChar->notify();
+  // Send data as binary: 6 floats (24 bytes)
+  // Format: ax, ay, az, gx, gy, gz (all little-endian float32)
+  Serial.write((uint8_t*)&ax, sizeof(float));
+  Serial.write((uint8_t*)&ay, sizeof(float));
+  Serial.write((uint8_t*)&az, sizeof(float));
+  Serial.write((uint8_t*)&gx, sizeof(float));
+  Serial.write((uint8_t*)&gy, sizeof(float));
+  Serial.write((uint8_t*)&gz, sizeof(float));
 }

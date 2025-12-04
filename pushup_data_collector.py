@@ -1,12 +1,11 @@
 """
 Pushup IMU Data Collection GUI
-Connects to XIAO ESP32S3 via BLE to collect accelerometer and gyroscope data
+Connects to XIAO ESP32S3 via USB Serial to collect accelerometer and gyroscope data
 for pushup phase and posture classification.
 
 Based on MagicWand data collector template.
 """
 
-import asyncio
 import json
 import tkinter as tk
 from tkinter import ttk, messagebox, filedialog
@@ -17,22 +16,21 @@ import matplotlib.pyplot as plt
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 from matplotlib.figure import Figure
 import numpy as np
+import threading
+import time
 
 try:
-    from bleak import BleakClient, BleakScanner
+    import serial
+    import serial.tools.list_ports
 except ImportError:
-    print("ERROR: bleak library not found. Install with: pip install bleak")
+    print("ERROR: pyserial library not found. Install with: pip install pyserial")
     exit(1)
-
-# BLE Configuration (matching MW_DataCollection firmware)
-DEVICE_NAME_PREFIX = "GAINS-Pushup"  # Device advertises as this name
-SERVICE_UUID = "0000ff00-0000-1000-8000-00805f9b34fb"
-IMU_CHAR_UUID = "0000ff01-0000-1000-8000-00805f9b34fb"
-CTRL_CHAR_UUID = "0000ff02-0000-1000-8000-00805f9b34fb"
 
 # Data collection settings
 SAMPLE_RATE = 40  # Hz (25ms period from firmware)
 BUFFER_SIZE = 200  # Keep last 5 seconds of data for visualization
+BAUD_RATE = 115200
+PACKET_SIZE = 24  # 6 floats × 4 bytes
 
 
 
@@ -40,13 +38,14 @@ BUFFER_SIZE = 200  # Keep last 5 seconds of data for visualization
 class PushupDataCollector:
     def __init__(self, root):
         self.root = root
-        self.root.title("Pushup IMU Data Collector")
+        self.root.title("Pushup IMU Data Collector (Serial Mode)")
         self.root.geometry("1000x800")
 
-        # BLE state
-        self.client = None
-        self.device = None
+        # Serial state
+        self.serial_port = None
         self.is_connected = False
+        self.reader_thread = None
+        self.stop_reading = False
 
         # Recording state
         self.is_recording = False
@@ -67,9 +66,6 @@ class PushupDataCollector:
 
         # Create UI
         self.create_ui()
-
-        # Asyncio loop for BLE
-        self.loop = asyncio.new_event_loop()
 
     def create_ui(self):
         """Create the main UI layout"""
@@ -218,78 +214,61 @@ class PushupDataCollector:
         self.root.update_idletasks()
 
     def connect_device(self):
-        """Scan for and connect to BLE device"""
-        self.log("Scanning for BLE devices...")
-        asyncio.set_event_loop(self.loop)
-        self.loop.run_until_complete(self._connect_async())
-
-    async def _connect_async(self):
-        """Async BLE connection - automatically connects to GAINS-Pushup device"""
+        """Connect to ESP32 via USB Serial"""
         try:
-            self.log(f"Scanning for '{DEVICE_NAME_PREFIX}' device...")
-            devices = await BleakScanner.discover(timeout=5.0)
+            self.log("Scanning for serial ports...")
 
-            # Filter for our device name
-            target = None
-            for device in devices:
-                if device.name and device.name.startswith(DEVICE_NAME_PREFIX):
-                    target = device
-                    break
+            # List all available serial ports
+            ports = serial.tools.list_ports.comports()
 
-            if not target:
-                self.log(f"ERROR: No device found with name '{DEVICE_NAME_PREFIX}'")
+            # Filter for ESP32 devices (common USB-Serial chip identifiers)
+            esp32_ports = []
+            for port in ports:
+                # Look for common ESP32 USB identifiers
+                if any(x in port.description.lower() for x in ['usb', 'serial', 'uart', 'ch340', 'cp210', 'ftdi', 'esp32']):
+                    esp32_ports.append(port)
+
+            if not esp32_ports:
+                self.log("ERROR: No serial devices found")
                 messagebox.showerror("Device Not Found",
-                    f"Could not find '{DEVICE_NAME_PREFIX}' device.\n\n" +
+                    "No USB serial devices found.\n\n" +
                     "Make sure:\n" +
-                    "- Your device is powered on\n" +
-                    "- Bluetooth is enabled on this computer\n" +
-                    "- The firmware is running (device should advertise as GAINS-Pushup)\n" +
-                    "- You are within range")
+                    "- Your ESP32 is connected via USB\n" +
+                    "- The USB cable supports data transfer\n" +
+                    "- Drivers are installed for your device")
                 return
 
-            device_name = target.name
-            self.log(f"Found {device_name} ({target.address})")
-            self.log("Connecting...")
+            # If multiple ports, let user choose
+            if len(esp32_ports) > 1:
+                port_names = [f"{p.device} - {p.description}" for p in esp32_ports]
+                # For simplicity, use the first one. You could add a selection dialog here
+                selected_port = esp32_ports[0].device
+                self.log(f"Multiple ports found, using: {selected_port}")
+            else:
+                selected_port = esp32_ports[0].device
+                self.log(f"Found device: {esp32_ports[0].description}")
 
-            # Connect to device
-            self.client = BleakClient(target.address)
-            await self.client.connect()
+            # Open serial connection
+            self.serial_port = serial.Serial(
+                port=selected_port,
+                baudrate=BAUD_RATE,
+                timeout=1
+            )
 
-            if not self.client.is_connected:
-                raise Exception("Failed to establish connection")
+            time.sleep(2)  # Wait for ESP32 to reset after serial connection
 
-            self.log("Connected - discovering services...")
-
-            # Give BLE stack time to complete service discovery
-            await asyncio.sleep(0.5)
-
-            # Verify control characteristic exists and is writable
-            try:
-                # Try to access the characteristic to verify it exists
-                services = self.client.services
-                found_ctrl = False
-                for service in services:
-                    for char in service.characteristics:
-                        if char.uuid.lower() == CTRL_CHAR_UUID.lower():
-                            found_ctrl = True
-                            self.log(f"✓ Found control characteristic (writable: {'write' in char.properties})")
-                            break
-                    if found_ctrl:
-                        break
-
-                if not found_ctrl:
-                    raise Exception(f"Control characteristic {CTRL_CHAR_UUID} not found")
-            except Exception as e:
-                self.log(f"Warning: Could not verify control characteristic: {e}")
-
-            self.log("Starting notifications...")
-
-            # Start notifications on IMU characteristic
-            await self.client.start_notify(IMU_CHAR_UUID, self._imu_notification_handler)
+            # Clear any existing data in buffer
+            self.serial_port.reset_input_buffer()
 
             self.is_connected = True
-            self.status_label.config(text=f"🟢 Connected to {device_name}", foreground="green")
-            self.log(f"✓ Connected successfully to {device_name}!")
+            self.stop_reading = False
+
+            # Start reader thread
+            self.reader_thread = threading.Thread(target=self._serial_reader, daemon=True)
+            self.reader_thread.start()
+
+            self.status_label.config(text=f"🟢 Connected to {selected_port}", foreground="green")
+            self.log(f"✓ Connected successfully to {selected_port}!")
 
             # Start visualization update
             self.update_plots()
@@ -299,33 +278,81 @@ class PushupDataCollector:
             messagebox.showerror("Connection Error", f"Failed to connect:\n{str(e)}")
 
     def disconnect_device(self):
-        """Disconnect from BLE device"""
-        if self.client and self.is_connected:
-            asyncio.set_event_loop(self.loop)
-            self.loop.run_until_complete(self._disconnect_async())
-
-    async def _disconnect_async(self):
-        """Async BLE disconnection"""
+        """Disconnect from serial device"""
         try:
             if self.is_recording:
-                await self.client.write_gatt_char(CTRL_CHAR_UUID, bytearray([0x00]))
-                self.is_recording = False
+                self.stop_recording()
 
-            await self.client.disconnect()
+            self.stop_reading = True
             self.is_connected = False
+
+            if self.reader_thread:
+                self.reader_thread.join(timeout=2)
+
+            if self.serial_port and self.serial_port.is_open:
+                self.serial_port.close()
+
             self.status_label.config(text="⚫ Not Connected", foreground="red")
             self.log("Disconnected")
+
         except Exception as e:
             self.log(f"ERROR during disconnect: {str(e)}")
 
-    def _imu_notification_handler(self, sender, data):
-        """Handle incoming IMU data from BLE"""
-        if len(data) < 24:
+    def _serial_reader(self):
+        """Background thread to read serial data"""
+        buffer = bytearray()
+
+        while not self.stop_reading and self.is_connected:
+            try:
+                if self.serial_port and self.serial_port.in_waiting > 0:
+                    data = self.serial_port.read(self.serial_port.in_waiting)
+                    buffer.extend(data)
+
+                    # Process complete packets
+                    while len(buffer) >= PACKET_SIZE:
+                        # Check if this looks like a valid packet (not a text message)
+                        # Text messages will have printable ASCII characters
+                        packet = buffer[:PACKET_SIZE]
+
+                        # Skip if it looks like text (contains newline or printable chars)
+                        if b'\n' in packet or b'[' in packet:
+                            # This is a text message, skip until newline
+                            try:
+                                newline_idx = buffer.index(b'\n')
+                                buffer = buffer[newline_idx+1:]
+                            except ValueError:
+                                buffer = buffer[1:]  # Remove one byte and try again
+                            continue
+
+                        # Try to parse as IMU data
+                        try:
+                            self._process_packet(bytes(packet))
+                            buffer = buffer[PACKET_SIZE:]
+                        except:
+                            # Invalid packet, skip one byte
+                            buffer = buffer[1:]
+
+                time.sleep(0.001)  # Small delay to prevent CPU spinning
+
+            except Exception as e:
+                if self.is_connected:
+                    self.log(f"Reader error: {str(e)}")
+                break
+
+    def _process_packet(self, packet):
+        """Process a packet of IMU data"""
+        if len(packet) < PACKET_SIZE:
             return
 
         # Parse 6 floats (ax, ay, az, gx, gy, gz) - little endian
-        values = struct.unpack('<ffffff', data[:24])
+        values = struct.unpack('<ffffff', packet)
         ax, ay, az, gx, gy, gz = values
+
+        # Sanity check values
+        if abs(ax) > 20 or abs(ay) > 20 or abs(az) > 20:
+            return  # Invalid accelerometer data
+        if abs(gx) > 2000 or abs(gy) > 2000 or abs(gz) > 2000:
+            return  # Invalid gyro data
 
         # Update buffers for visualization
         if self.start_time is None:
@@ -393,16 +420,16 @@ class PushupDataCollector:
 
     def start_recording(self):
         """Start recording IMU data"""
-        if not self.is_connected or not self.client or not self.client.is_connected:
+        if not self.is_connected or not self.serial_port or not self.serial_port.is_open:
             messagebox.showwarning("Not Connected", "Please connect to device first")
             return
 
         try:
-            # Send start command to device
-            asyncio.set_event_loop(self.loop)
-            self.loop.run_until_complete(
-                self.client.write_gatt_char(CTRL_CHAR_UUID, bytearray([0x01]))
-            )
+            # Send START command to ESP32
+            self.serial_port.write(b"START\n")
+            self.serial_port.flush()
+            self.log("Sent START command to device")
+
         except Exception as e:
             self.log(f"ERROR: Failed to start recording - {str(e)}")
             messagebox.showerror("Recording Error",
@@ -445,10 +472,10 @@ class PushupDataCollector:
 
         # Send stop command to device
         try:
-            asyncio.set_event_loop(self.loop)
-            self.loop.run_until_complete(
-                self.client.write_gatt_char(CTRL_CHAR_UUID, bytearray([0x00]))
-            )
+            if self.serial_port and self.serial_port.is_open:
+                self.serial_port.write(b"STOP\n")
+                self.serial_port.flush()
+                self.log("Sent STOP command to device")
         except Exception as e:
             self.log(f"Warning: Failed to send stop command - {str(e)}")
 
@@ -557,6 +584,13 @@ class PushupDataCollector:
 
 def main():
     """Main entry point"""
+    print("=" * 60)
+    print("Pushup IMU Data Collector (Serial Mode)")
+    print("=" * 60)
+    print("\nIMPORTANT: Make sure you have installed pyserial:")
+    print("  pip install pyserial")
+    print("\nConnect your ESP32 via USB before clicking 'Connect to Device'\n")
+
     root = tk.Tk()
     app = PushupDataCollector(root)
 

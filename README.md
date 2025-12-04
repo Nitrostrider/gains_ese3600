@@ -17,3 +17,10 @@ To run inference model:
 1. Run python notebook in google colab (use GPU)
 2. Copy and paste the binary file into pushup_model_data.cpp
 3. Flash the script in gains_ese3600 (must be done with home directory being gains_ese3600)
+
+
+To use pio CLI:
+1. ```pio run```
+2. ```pio upload```
+
+3. ```pio run -t upload```
