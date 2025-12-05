@@ -1,5 +1,6 @@
-/* GAINS Pushup Posture & Phase Classification
- * Using TensorFlow Lite Micro with multi-task CNN-LSTM model
+/* GAINS Pushup Posture Classification
+ * Using TensorFlow Lite Micro with CNN model
+ * Classifies 4 posture types: good-form, hips-high, hips-sagging, partial-rom
  *
  * Hardware: Seeed Studio XIAO ESP32S3 + ICM-20600 IMU
  */
@@ -20,9 +21,6 @@
 #include "imu_provider.h"
 #include "pushup_model_data.h"
 
-// I2C scanner for debugging
-void scan_i2c_bus();
-
 /* Pins on the Seeed Studio XIAO are labeled incorrectly.
    Pin 'n' here refers to pin 'n-1' on the board. Pins 5 and 6 cannot be used since
    they are I2C pins between the ESP-32 Microcontroller and the OLED display */
@@ -30,51 +28,47 @@ const int buttonPin = 4;  // pushbutton pin
 const int ledPin    = 3;  // LED pin
 
 // ===== MODEL CONFIGURATION =====
-// TODO: Update these based on your trained model metadata
-constexpr int WINDOW_SIZE = 100;        // Number of IMU samples per window
+// Update these based on your trained model metadata
+constexpr int WINDOW_SIZE = 50;         // Number of IMU samples per window (50 @ 40Hz = 1.25s)
 constexpr int NUM_CHANNELS = 6;         // ax, ay, az, gx, gy, gz
-constexpr int NUM_PHASE_CLASSES = 4;    // Updated to match your actual model
-constexpr int NUM_POSTURE_CLASSES = 2;  // Updated to match your actual model
-
-// Phase labels - MUST match model output order!
-const char* phase_labels[NUM_PHASE_CLASSES] = {
-    "moving-down",
-    "moving-up",
-    "not-in-pushup",
-    "top"
-};
+constexpr int NUM_POSTURE_CLASSES = 4;  // 4 posture types
 
 // Posture labels - MUST match model output order!
+// From pushup_model_metadata.json: ["good-form", "hips-high", "hips-sagging", "partial-rom"]
 const char* posture_labels[NUM_POSTURE_CLASSES] = {
-    "good-form",
-    "hips-sagging"
+    "good-form",    // Class 0
+    "hips-high",    // Class 1
+    "hips-sagging", // Class 2
+    "partial-rom"   // Class 3
 };
 
 // ===== NORMALIZATION PARAMETERS =====
-// TODO: Replace with values from norm_params.json generated during training
+// Replace with values from pushup_model_metadata.json generated during training
 // These are computed from your training data: mean and std per channel
-float imu_mean[NUM_CHANNELS] = { 0.5408033083196272,
-        0.32900583367598685,
-        0.49756270559210525,
-        1.299851319710234,
-        -0.6161175886499124,
-        0.024165001748325792};
-float imu_std[NUM_CHANNELS] = {0.4391443151852503,
-        0.35146379602399636,
-        0.2542886946241483,
-        28.78840837535021,
-        21.548818392843355,
-        22.036605220632804};
+float imu_mean[NUM_CHANNELS] = {
+    0.21002981838521975,
+    -0.012597600868383742,
+    0.9683456599734906,
+    0.17634020483573734,
+    1.1392008499625985,
+    0.9496813799078279
+};
+float imu_std[NUM_CHANNELS] = {0.2788689179258505,
+    0.11287905247385777,
+    0.28730744260394775,
+    13.642031321723314,
+    36.710716288881166,
+    6.244813331362449};
 
 // ===== IMU BUFFER =====
 // Circular buffer for sliding window
 constexpr int BUFFER_SIZE = WINDOW_SIZE;
-float imu_buffer[BUFFER_SIZE][NUM_CHANNELS];  // [100][6]
+float imu_buffer[BUFFER_SIZE][NUM_CHANNELS];  // [50][6]
 int buffer_index = 0;
 int samples_collected = 0;
 
 // ===== TENSORFLOW LITE MICRO =====
-constexpr int kTensorArenaSize = 120 * 1024;  // 120 KB for CNN-LSTM model
+constexpr int kTensorArenaSize = 120 * 1024;  // 120 KB for CNN model (58 KB model + working memory)
 alignas(16) uint8_t tensor_arena[kTensorArenaSize];
 
 const tflite::Model* model = nullptr;
@@ -162,26 +156,8 @@ void RunInference() {
     // Feed watchdog again after inference
     esp_task_wdt_reset();
 
-    // Get output tensors (multi-task model has 2 outputs)
-    TfLiteTensor* phase_output = interpreter->output(0);
-    TfLiteTensor* posture_output = interpreter->output(1);
-
-    // Dequantize phase predictions
-    const float phase_scale = phase_output->params.scale;
-    const int phase_zp = phase_output->params.zero_point;
-
-    float phase_probs[NUM_PHASE_CLASSES];
-    int best_phase = 0;
-    float max_phase_prob = -1.0f;
-
-    for (int i = 0; i < NUM_PHASE_CLASSES; i++) {
-        float p = phase_scale * (static_cast<int>(phase_output->data.int8[i]) - phase_zp);
-        phase_probs[i] = p;
-        if (p > max_phase_prob) {
-            max_phase_prob = p;
-            best_phase = i;
-        }
-    }
+    // Get output tensor (single-task model with 1 output: posture)
+    TfLiteTensor* posture_output = interpreter->output(0);
 
     // Dequantize posture predictions
     const float posture_scale = posture_output->params.scale;
@@ -202,13 +178,6 @@ void RunInference() {
 
     // Print results to serial
     Serial.println("\n========== PREDICTION ==========");
-
-    Serial.print("Phase: ");
-    Serial.print(phase_labels[best_phase]);
-    Serial.print(" (");
-    Serial.print(max_phase_prob * 100, 1);
-    Serial.println("%)");
-
     Serial.print("Posture: ");
     Serial.print(posture_labels[best_posture]);
     Serial.print(" (");
@@ -216,48 +185,28 @@ void RunInference() {
     Serial.println("%)");
 
     // Print all probabilities for debugging
-    Serial.println("\nAll Phase Probabilities:");
-    for (int i = 0; i < NUM_PHASE_CLASSES; i++) {
-        if (phase_probs[i] > 0.05f) {  // Only show >5%
-            Serial.print("  ");
-            Serial.print(phase_labels[i]);
-            Serial.print(": ");
-            Serial.print(phase_probs[i] * 100, 1);
-            Serial.println("%");
-        }
-    }
-
     Serial.println("\nAll Posture Probabilities:");
     for (int i = 0; i < NUM_POSTURE_CLASSES; i++) {
-        if (posture_probs[i] > 0.05f) {
-            Serial.print("  ");
-            Serial.print(posture_labels[i]);
-            Serial.print(": ");
-            Serial.print(posture_probs[i] * 100, 1);
-            Serial.println("%");
-        }
+        Serial.print("  ");
+        Serial.print(posture_labels[i]);
+        Serial.print(": ");
+        Serial.print(posture_probs[i] * 100, 1);
+        Serial.println("%");
     }
     Serial.println("================================\n");
 
     // Update OLED display with results
     oled_display_clear();
     oled_display_text(0, 0, "GAINS");
+    oled_display_text(0, 16, "Posture:");
 
-    char line1[32];
-    snprintf(line1, sizeof(line1), "Ph: %s", phase_labels[best_phase]);
-    oled_display_text(0, 16, line1);
+    char posture_line[32];
+    snprintf(posture_line, sizeof(posture_line), "%s", posture_labels[best_posture]);
+    oled_display_text(0, 32, posture_line);
 
-    char line2[32];
-    snprintf(line2, sizeof(line2), "    %.0f%%", max_phase_prob * 100);
-    oled_display_text(0, 26, line2);
-
-    char line3[32];
-    snprintf(line3, sizeof(line3), "Po: %s", posture_labels[best_posture]);
-    oled_display_text(0, 40, line3);
-
-    char line4[32];
-    snprintf(line4, sizeof(line4), "    %.0f%%", max_posture_prob * 100);
-    oled_display_text(0, 50, line4);
+    char conf_line[32];
+    snprintf(conf_line, sizeof(conf_line), "%.0f%% confident", max_posture_prob * 100);
+    oled_display_text(0, 48, conf_line);
 
     oled_display_update();
 }
@@ -308,10 +257,6 @@ void setup() {
     pinMode(ledPin, OUTPUT);
     pinMode(buttonPin, INPUT);
     attachInterrupt(digitalPinToInterrupt(buttonPin), handleButtonInterrupt, CHANGE);
-
-    // DEBUG: Scan I2C bus to find connected devices
-    Serial.println("\n--- Scanning I2C bus ---");
-    scan_i2c_bus();
 
     // Initialize IMU
     if (!SetupIMU()) {
