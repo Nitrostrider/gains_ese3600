@@ -65,7 +65,7 @@ void loop() {
                 // OLED update for button pressed
                 oled_display_clear();
                 oled_display_text(0, 10, "GAINS");
-                oled_display_text(0, 30, "Started recording. Press button to stop.");
+                oled_display_text(0, 30, "Recording.");
                 oled_display_update();
 
                 // LED is on while recording
@@ -82,7 +82,7 @@ void loop() {
                 // OLED update for stopping recording
                 oled_display_clear();
                 oled_display_text(0, 10, "GAINS");
-                oled_display_text(0, 30, "Stopped Recording. Press button to start again.");
+                oled_display_text(0, 30, "Not Recording.");
                 oled_display_update();
 
                 // LED is off while not recording
