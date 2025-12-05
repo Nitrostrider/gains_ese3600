@@ -29,6 +29,7 @@
 #define NOTE_A4 440
 #define NOTE_AS4 466
 #define NOTE_C5 523
+#define NOTE_E5 659
 
 /* Pins on the Seeed Studio XIAO are labeled incorrectly.
    Pin 'n' here refers to pin 'n-1' on the board. Pins 5 and 6 (4 and 5 on the board) cannot be used since
@@ -55,6 +56,7 @@ void IRAM_ATTR handleButtonInterrupt() {
 constexpr int WINDOW_SIZE = 50;         // Number of IMU samples per window (50 @ 40Hz = 1.25s)
 constexpr int NUM_CHANNELS = 6;         // ax, ay, az, gx, gy, gz
 constexpr int NUM_POSTURE_CLASSES = 4;  // 4 posture types
+constexpr int NUM_PHASE_CLASSES = 3;    // 3 phase types
 
 // Posture labels - MUST match model output order!
 // From pushup_model_metadata.json: ["good-form", "hips-high", "hips-sagging", "partial-rom"]
@@ -64,6 +66,38 @@ const char* posture_labels[NUM_POSTURE_CLASSES] = {
     "hips-sagging", // Class 2
     "partial-rom"   // Class 3
 };
+
+// Phase labels - MUST match model output order!
+// Multi-task model output: ["at-top", "moving", "at-bottom"]
+const char* phase_labels[NUM_PHASE_CLASSES] = {
+    "at-top",      // Class 0
+    "moving",      // Class 1
+    "at-bottom"    // Class 2
+};
+
+// ===== REP COUNTING STATE MACHINE =====
+enum PushupState {
+    STATE_IDLE = 0,
+    STATE_AT_TOP,
+    STATE_DESCENDING,
+    STATE_AT_BOTTOM,
+    STATE_ASCENDING
+};
+
+struct RepCounter {
+    int total_reps;
+    int good_form_reps;
+    int poor_form_reps;
+    PushupState state;
+    int phase_confirm_count;      // Hysteresis counter
+    int good_form_count;           // Form tracking during rep
+    int poor_form_count;
+    unsigned long state_enter_time;  // Timeout tracking
+};
+
+RepCounter rep_counter = {0, 0, 0, STATE_IDLE, 0, 0, 0, 0};
+
+const unsigned long STATE_TIMEOUT_MS = 10000;  // 10 seconds
 
 // ===== NORMALIZATION PARAMETERS =====
 // Replace with values from pushup_model_metadata.json generated during training
@@ -111,6 +145,164 @@ void NormalizeWindow(float normalized_window[WINDOW_SIZE][NUM_CHANNELS]) {
             normalized_window[i][ch] = (imu_buffer[buf_idx][ch] - imu_mean[ch]) / (imu_std[ch] + 1e-8f);
         }
     }
+}
+
+int GetBestClass(TfLiteTensor* output, int num_classes) {
+    // Dequantize and find class with highest probability
+    const float scale = output->params.scale;
+    const int zp = output->params.zero_point;
+
+    int best_class = 0;
+    float max_prob = -1.0f;
+
+    for (int i = 0; i < num_classes; i++) {
+        float prob = scale * (static_cast<int>(output->data.int8[i]) - zp);
+        if (prob > max_prob) {
+            max_prob = prob;
+            best_class = i;
+        }
+    }
+
+    return best_class;
+}
+
+void CompleteRep() {
+    // Increment total rep counter
+    rep_counter.total_reps++;
+
+    // Classify rep based on form tracking during the rep
+    bool is_good_form = (rep_counter.good_form_count > rep_counter.poor_form_count);
+
+    if (is_good_form) {
+        rep_counter.good_form_reps++;
+        // Happy buzzer: two ascending notes
+        tone(BUZZER_PIN, NOTE_C5, 100);
+        delay(100);
+        noTone(BUZZER_PIN);
+        delay(50);
+        tone(BUZZER_PIN, NOTE_E5, 100);
+        delay(100);
+        noTone(BUZZER_PIN);
+    } else {
+        rep_counter.poor_form_reps++;
+        // Warning buzzer: single low note
+        tone(BUZZER_PIN, NOTE_C4, 200);
+        delay(200);
+        noTone(BUZZER_PIN);
+    }
+
+    // Reset form counters for next rep
+    rep_counter.good_form_count = 0;
+    rep_counter.poor_form_count = 0;
+
+    // Serial output
+    Serial.printf("\n========== REP #%d COMPLETED ==========\n", rep_counter.total_reps);
+    Serial.printf("Form: %s\n", is_good_form ? "GOOD" : "POOR");
+    Serial.printf("Total: %d | Good: %d | Poor: %d\n",
+                  rep_counter.total_reps,
+                  rep_counter.good_form_reps,
+                  rep_counter.poor_form_reps);
+    Serial.println("======================================\n");
+}
+
+void UpdateRepCounter(int phase, int posture) {
+    // Track posture quality during rep
+    if (posture == 0) {  // good-form
+        rep_counter.good_form_count++;
+    } else {
+        rep_counter.poor_form_count++;
+    }
+
+    // State transitions with hysteresis
+    PushupState old_state = rep_counter.state;
+
+    switch (rep_counter.state) {
+        case STATE_IDLE:
+            if (phase == 0) {  // at-top
+                rep_counter.state = STATE_AT_TOP;
+            }
+            break;
+
+        case STATE_AT_TOP:
+            if (phase == 1) {  // moving
+                rep_counter.phase_confirm_count++;
+                if (rep_counter.phase_confirm_count >= 2) {
+                    rep_counter.state = STATE_DESCENDING;
+                    rep_counter.phase_confirm_count = 0;
+                }
+            } else {
+                rep_counter.phase_confirm_count = 0;
+            }
+            break;
+
+        case STATE_DESCENDING:
+            if (phase == 2) {  // at-bottom
+                rep_counter.phase_confirm_count++;
+                if (rep_counter.phase_confirm_count >= 2) {
+                    rep_counter.state = STATE_AT_BOTTOM;
+                    rep_counter.phase_confirm_count = 0;
+                    // Quick beep at bottom
+                    tone(BUZZER_PIN, NOTE_D4, 50);
+                    delay(50);
+                    noTone(BUZZER_PIN);
+                }
+            } else {
+                rep_counter.phase_confirm_count = 0;
+            }
+            break;
+
+        case STATE_AT_BOTTOM:
+            if (phase == 1) {  // moving
+                rep_counter.phase_confirm_count++;
+                if (rep_counter.phase_confirm_count >= 2) {
+                    rep_counter.state = STATE_ASCENDING;
+                    rep_counter.phase_confirm_count = 0;
+                }
+            } else {
+                rep_counter.phase_confirm_count = 0;
+            }
+            break;
+
+        case STATE_ASCENDING:
+            if (phase == 0) {  // at-top
+                rep_counter.phase_confirm_count++;
+                if (rep_counter.phase_confirm_count >= 2) {
+                    CompleteRep();  // REP COMPLETED!
+                    rep_counter.state = STATE_AT_TOP;
+                    rep_counter.phase_confirm_count = 0;
+                }
+            } else {
+                rep_counter.phase_confirm_count = 0;
+            }
+            break;
+    }
+
+    // Track state entry time for timeout detection
+    if (rep_counter.state != old_state) {
+        rep_counter.state_enter_time = millis();
+    }
+}
+
+void DisplayRepCount() {
+    oled_display_clear();
+    oled_display_text(0, 0, "PUSHUP TRACKER");
+
+    char rep_line[32];
+    snprintf(rep_line, sizeof(rep_line), "Total: %d", rep_counter.total_reps);
+    oled_display_text(0, 16, rep_line);
+
+    char form_line[32];
+    snprintf(form_line, sizeof(form_line), "Good:%d Poor:%d",
+             rep_counter.good_form_reps,
+             rep_counter.poor_form_reps);
+    oled_display_text(0, 32, form_line);
+
+    char state_line[32];
+    const char* state_names[] = {"IDLE", "TOP", "DOWN", "BOTTOM", "UP"};
+    snprintf(state_line, sizeof(state_line), "%s", state_names[rep_counter.state]);
+    oled_display_text(0, 48, state_line);
+
+    oled_display_update();
 }
 
 void RunInference() {
@@ -168,59 +360,29 @@ void RunInference() {
     // Feed watchdog again after inference
     esp_task_wdt_reset();
 
-    // Get output tensor (single-task model with 1 output: posture)
-    TfLiteTensor* posture_output = interpreter->output(0);
+    // Get output tensors (multi-task model with 2 outputs)
+    TfLiteTensor* posture_output = interpreter->output(0);  // Posture: [4 classes]
+    TfLiteTensor* phase_output = interpreter->output(1);    // Phase: [3 classes]
 
-    // Dequantize posture predictions
-    const float posture_scale = posture_output->params.scale;
-    const int posture_zp = posture_output->params.zero_point;
-
-    float posture_probs[NUM_POSTURE_CLASSES];
-    int best_posture = 0;
-    float max_posture_prob = -1.0f;
-
-    for (int i = 0; i < NUM_POSTURE_CLASSES; i++) {
-        float p = posture_scale * (static_cast<int>(posture_output->data.int8[i]) - posture_zp);
-        posture_probs[i] = p;
-        if (p > max_posture_prob) {
-            max_posture_prob = p;
-            best_posture = i;
-        }
-    }
+    // Get best predictions using helper function
+    int best_posture = GetBestClass(posture_output, NUM_POSTURE_CLASSES);
+    int best_phase = GetBestClass(phase_output, NUM_PHASE_CLASSES);
 
     // Print results to serial
     Serial.println("\n========== PREDICTION ==========");
-    Serial.print("Posture: ");
-    Serial.print(posture_labels[best_posture]);
-    Serial.print(" (");
-    Serial.print(max_posture_prob * 100, 1);
-    Serial.println("%)");
-
-    // Print all probabilities for debugging
-    Serial.println("\nAll Posture Probabilities:");
-    for (int i = 0; i < NUM_POSTURE_CLASSES; i++) {
-        Serial.print("  ");
-        Serial.print(posture_labels[i]);
-        Serial.print(": ");
-        Serial.print(posture_probs[i] * 100, 1);
-        Serial.println("%");
-    }
+    Serial.printf("Posture: %s\n", posture_labels[best_posture]);
+    Serial.printf("Phase: %s\n", phase_labels[best_phase]);
+    Serial.printf("State: %s\n", (rep_counter.state == STATE_IDLE ? "IDLE" :
+                                   rep_counter.state == STATE_AT_TOP ? "TOP" :
+                                   rep_counter.state == STATE_DESCENDING ? "DOWN" :
+                                   rep_counter.state == STATE_AT_BOTTOM ? "BOTTOM" : "UP"));
     Serial.println("================================\n");
 
-    // Update OLED display with results
-    oled_display_clear();
-    oled_display_text(0, 0, "GAINS");
-    oled_display_text(0, 16, "Posture:");
+    // Update state machine with predictions
+    UpdateRepCounter(best_phase, best_posture);
 
-    char posture_line[32];
-    snprintf(posture_line, sizeof(posture_line), "%s", posture_labels[best_posture]);
-    oled_display_text(0, 32, posture_line);
-
-    char conf_line[32];
-    snprintf(conf_line, sizeof(conf_line), "%.0f%% confident", max_posture_prob * 100);
-    oled_display_text(0, 48, conf_line);
-
-    oled_display_update();
+    // Update OLED display with rep counter
+    DisplayRepCount();
 }
 
 // ====================================================================
@@ -450,6 +612,15 @@ void loop() {
         if (currentTime - lastInferenceTime >= INFERENCE_INTERVAL_MS) {
             lastInferenceTime = currentTime;
             RunInference();
+        }
+
+        // State machine timeout - reset if stuck in same state too long
+        if (rep_counter.state != STATE_IDLE &&
+            currentTime - rep_counter.state_enter_time > STATE_TIMEOUT_MS) {
+            Serial.println("STATE TIMEOUT - Reset to IDLE");
+            rep_counter.state = STATE_IDLE;
+            rep_counter.phase_confirm_count = 0;
+            rep_counter.state_enter_time = currentTime;
         }
     }
 
