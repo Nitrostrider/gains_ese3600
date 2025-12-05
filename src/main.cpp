@@ -1,3 +1,113 @@
+#include <Arduino.h>
+#include "oled_display.h" 
+
+// Note definitions for the speaker
+#define NOTE_C4 262
+#define NOTE_D4 294
+#define NOTE_E4 330
+#define NOTE_F4 349
+#define NOTE_G4 392
+#define NOTE_A4 440
+#define NOTE_AS4 466
+#define NOTE_C5 523
+
+/* Pins on the Seeed Studio XIAO are labeled incorrectly.
+   Pin 'n' here refers to pin 'n-1' on the board. Pins 5 and 6 (4 and 5 on the board) cannot be used since
+   they are I2C pins between the ESP-32 Microcontroller and the OLED display */
+
+const int BUZZER_PIN = 2;  // Buzzer pin
+const int BUTTON_PIN = 3;  // pushbutton pin
+const int RECORDING_LED_PIN = 4;  // LED pin
+
+// LOW = false; HIGH = true
+volatile bool buttonState = LOW;     // updated in ISR
+bool lastButtonState = LOW;          // tracks last state for change detection
+bool isRecording = false;        // recording state
+unsigned long lastOLEDUpdate = 0;    // timestamp for OLED throttling
+const unsigned long OLED_UPDATE_INTERVAL = 200; // ms
+
+void IRAM_ATTR handleButtonInterrupt() {
+    // Read button quickly in ISR
+    buttonState = digitalRead(BUTTON_PIN);
+}
+
+// void setup() {
+//     Serial.begin(115200);
+//     oled_display_init();   // initialize OLED
+//     oled_display_text(0, 10, "GAINS");
+//     oled_display_text(0, 30, "Press button to start recording.");
+//     oled_display_update();
+
+//     pinMode(BUTTON_PIN, INPUT);
+//     pinMode(BUZZER_PIN, OUTPUT);
+//     pinMode(RECORDING_LED_PIN, OUTPUT);
+
+//     attachInterrupt(digitalPinToInterrupt(BUTTON_PIN), handleButtonInterrupt, CHANGE);
+// }
+
+// void loop() {
+//     // Read the current button state
+//     bool currentState = buttonState;
+
+//     // Print button/LED state for debugging
+//     Serial.printf("Button: %s, LED: %s\n",
+//                   currentState ? "HIGH" : "LOW",
+//                   currentState ? "ON" : "OFF");
+
+//     // Only update OLED if the button state has changed
+//     if (currentState != lastButtonState) {
+//         lastButtonState = currentState;
+//         lastOLEDUpdate = millis();  // reset OLED timer
+
+//         if (currentState == HIGH) {
+//             if (!isRecording) {
+//                 isRecording = true;
+//                 // OLED update for button pressed
+//                 oled_display_clear();
+//                 oled_display_text(0, 10, "GAINS");
+//                 oled_display_text(0, 30, "Started recording. Press button to stop.");
+//                 oled_display_update();
+
+//                 // LED is on while recording
+//                 digitalWrite(RECORDING_LED_PIN, HIGH);
+
+//                 // Buzz tone to indicate start
+//                 tone(BUZZER_PIN, NOTE_D4, 100);
+//                 delay(100);
+//                 tone(BUZZER_PIN, NOTE_D4, 100);
+//                 noTone(BUZZER_PIN);
+
+//             } else {
+//                 isRecording = false;
+//                 // OLED update for stopping recording
+//                 oled_display_clear();
+//                 oled_display_text(0, 10, "GAINS");
+//                 oled_display_text(0, 30, "Stopped Recording. Press button to start again.");
+//                 oled_display_update();
+
+//                 // LED is off while not recording
+//                 digitalWrite(RECORDING_LED_PIN, LOW);
+
+//                 // Buzz tone to indicate stop
+//                 tone(BUZZER_PIN, NOTE_C4, 200);
+//                 noTone(BUZZER_PIN);
+
+//                 // if classification detected, play tune
+//             }
+//         }
+//     }
+
+//     // Optional: throttle OLED updates if the button is held down
+//     if (currentState == HIGH && millis() - lastOLEDUpdate >= OLED_UPDATE_INTERVAL) {
+//         lastOLEDUpdate = millis();
+//         oled_display_update(); // periodic refresh
+//     }
+
+//     delay(20); // small delay to reduce CPU usage and debounce slightly
+// }
+
+/* GAINS Pushup Posture & Phase Classification
+ * Using TensorFlow Lite Micro with multi-task CNN-LSTM model
 /* GAINS Pushup Posture Classification
  * Using TensorFlow Lite Micro with CNN model
  * Classifies 4 posture types: good-form, hips-high, hips-sagging, partial-rom
