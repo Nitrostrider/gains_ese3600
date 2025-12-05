@@ -4982,9 +4982,3 @@ unsigned char pushup_model_quantized_tflite[] = {
   0x46, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x46
 };
 unsigned int pushup_model_quantized_tflite_len = 59768;
-
-// Wrapper for main.cpp compatibility
-#include "pushup_model_data.h"
-
-const unsigned char* g_pushup_model_data = pushup_model_quantized_tflite;
-const int g_pushup_model_data_len = pushup_model_quantized_tflite_len;
