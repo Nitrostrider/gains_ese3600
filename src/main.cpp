@@ -1,5 +1,24 @@
+/* GAINS Pushup Posture Classification
+ * Using TensorFlow Lite Micro with CNN model
+ * Classifies 4 posture types: good-form, hips-high, hips-sagging, partial-rom
+ *
+ * Hardware: Seeed Studio XIAO ESP32S3 + ICM-20600 IMU
+ */
 #include <Arduino.h>
 #include "oled_display.h" 
+#include "esp_task_wdt.h"
+#include "esp_system.h"
+
+#include "tensorflow/lite/micro/micro_interpreter.h"
+#include "tensorflow/lite/micro/micro_log.h"
+#include "tensorflow/lite/micro/micro_mutable_op_resolver.h"
+#include "tensorflow/lite/micro/system_setup.h"
+#include "tensorflow/lite/schema/schema_generated.h"
+#include "tensorflow/lite/version.h"
+#include "tensorflow/lite/micro/all_ops_resolver.h"
+
+#include "imu_provider.h"
+#include "pushup_model_data.h"
 
 // Note definitions for the speaker
 #define NOTE_C4 262
@@ -22,7 +41,7 @@ const int RECORDING_LED_PIN = 4;  // LED pin
 // LOW = false; HIGH = true
 volatile bool buttonState = LOW;     // updated in ISR
 bool lastButtonState = LOW;          // tracks last state for change detection
-bool isRecording = false;        // recording state
+bool inferenceEnabled = false;        // recording state (aka inferenceEnabled)
 unsigned long lastOLEDUpdate = 0;    // timestamp for OLED throttling
 const unsigned long OLED_UPDATE_INTERVAL = 200; // ms
 
@@ -30,112 +49,6 @@ void IRAM_ATTR handleButtonInterrupt() {
     // Read button quickly in ISR
     buttonState = digitalRead(BUTTON_PIN);
 }
-
-// void setup() {
-//     Serial.begin(115200);
-//     oled_display_init();   // initialize OLED
-//     oled_display_text(0, 10, "GAINS");
-//     oled_display_text(0, 30, "Press button to start recording.");
-//     oled_display_update();
-
-//     pinMode(BUTTON_PIN, INPUT);
-//     pinMode(BUZZER_PIN, OUTPUT);
-//     pinMode(RECORDING_LED_PIN, OUTPUT);
-
-//     attachInterrupt(digitalPinToInterrupt(BUTTON_PIN), handleButtonInterrupt, CHANGE);
-// }
-
-// void loop() {
-//     // Read the current button state
-//     bool currentState = buttonState;
-
-//     // Print button/LED state for debugging
-//     Serial.printf("Button: %s, LED: %s\n",
-//                   currentState ? "HIGH" : "LOW",
-//                   currentState ? "ON" : "OFF");
-
-//     // Only update OLED if the button state has changed
-//     if (currentState != lastButtonState) {
-//         lastButtonState = currentState;
-//         lastOLEDUpdate = millis();  // reset OLED timer
-
-//         if (currentState == HIGH) {
-//             if (!isRecording) {
-//                 isRecording = true;
-//                 // OLED update for button pressed
-//                 oled_display_clear();
-//                 oled_display_text(0, 10, "GAINS");
-//                 oled_display_text(0, 30, "Started recording. Press button to stop.");
-//                 oled_display_update();
-
-//                 // LED is on while recording
-//                 digitalWrite(RECORDING_LED_PIN, HIGH);
-
-//                 // Buzz tone to indicate start
-//                 tone(BUZZER_PIN, NOTE_D4, 100);
-//                 delay(100);
-//                 tone(BUZZER_PIN, NOTE_D4, 100);
-//                 noTone(BUZZER_PIN);
-
-//             } else {
-//                 isRecording = false;
-//                 // OLED update for stopping recording
-//                 oled_display_clear();
-//                 oled_display_text(0, 10, "GAINS");
-//                 oled_display_text(0, 30, "Stopped Recording. Press button to start again.");
-//                 oled_display_update();
-
-//                 // LED is off while not recording
-//                 digitalWrite(RECORDING_LED_PIN, LOW);
-
-//                 // Buzz tone to indicate stop
-//                 tone(BUZZER_PIN, NOTE_C4, 200);
-//                 noTone(BUZZER_PIN);
-
-//                 // if classification detected, play tune
-//             }
-//         }
-//     }
-
-//     // Optional: throttle OLED updates if the button is held down
-//     if (currentState == HIGH && millis() - lastOLEDUpdate >= OLED_UPDATE_INTERVAL) {
-//         lastOLEDUpdate = millis();
-//         oled_display_update(); // periodic refresh
-//     }
-
-//     delay(20); // small delay to reduce CPU usage and debounce slightly
-// }
-
-/* GAINS Pushup Posture & Phase Classification
- * Using TensorFlow Lite Micro with multi-task CNN-LSTM model
-/* GAINS Pushup Posture Classification
- * Using TensorFlow Lite Micro with CNN model
- * Classifies 4 posture types: good-form, hips-high, hips-sagging, partial-rom
- *
- * Hardware: Seeed Studio XIAO ESP32S3 + ICM-20600 IMU
- */
-
-#include <Arduino.h>
-#include "oled_display.h"
-#include "esp_task_wdt.h"
-#include "esp_system.h"
-
-#include "tensorflow/lite/micro/micro_interpreter.h"
-#include "tensorflow/lite/micro/micro_log.h"
-#include "tensorflow/lite/micro/micro_mutable_op_resolver.h"
-#include "tensorflow/lite/micro/system_setup.h"
-#include "tensorflow/lite/schema/schema_generated.h"
-#include "tensorflow/lite/version.h"
-#include "tensorflow/lite/micro/all_ops_resolver.h"
-
-#include "imu_provider.h"
-#include "pushup_model_data.h"
-
-/* Pins on the Seeed Studio XIAO are labeled incorrectly.
-   Pin 'n' here refers to pin 'n-1' on the board. Pins 5 and 6 cannot be used since
-   they are I2C pins between the ESP-32 Microcontroller and the OLED display */
-const int buttonPin = 4;  // pushbutton pin
-const int ledPin    = 3;  // LED pin
 
 // ===== MODEL CONFIGURATION =====
 // Update these based on your trained model metadata
@@ -184,20 +97,9 @@ alignas(16) uint8_t tensor_arena[kTensorArenaSize];
 const tflite::Model* model = nullptr;
 tflite::MicroInterpreter* interpreter = nullptr;
 
-// ===== BUTTON STATE =====
-volatile bool buttonState = LOW;
-bool lastButtonState = LOW;
-bool inferenceEnabled = false;  // Changed from isRecording - controls inference
-unsigned long lastOLEDUpdate = 0;
-const unsigned long OLED_UPDATE_INTERVAL = 200; // ms
-
 // ===== INFERENCE CONTROL =====
 constexpr int INFERENCE_INTERVAL_MS = 1000;  // Run inference every 1 second when enabled
 unsigned long lastInferenceTime = 0;
-
-void IRAM_ATTR handleButtonInterrupt() {
-    buttonState = digitalRead(buttonPin);
-}
 
 // ===== HELPER FUNCTIONS =====
 
@@ -352,6 +254,11 @@ void setup() {
 
     tflite::InitializeTarget();
 
+    // Configure watchdog timer (10 second timeout)
+    esp_task_wdt_init(10, true);  // 10 second timeout, panic on timeout
+    esp_task_wdt_add(NULL);       // Add current task to watchdog
+    Serial.println("✓ Watchdog timer configured");
+
     Serial.println("\n========================================");
     Serial.println("  GAINS - Pushup Posture Classifier");
     Serial.println("========================================");
@@ -360,13 +267,14 @@ void setup() {
     // Initialize OLED
     oled_display_init();
     oled_display_text(0, 10, "GAINS");
-    oled_display_text(0, 30, "Initializing...");
     oled_display_update();
 
     // Initialize button and LED
-    pinMode(ledPin, OUTPUT);
-    pinMode(buttonPin, INPUT);
-    attachInterrupt(digitalPinToInterrupt(buttonPin), handleButtonInterrupt, CHANGE);
+    pinMode(BUTTON_PIN, INPUT);
+    pinMode(BUZZER_PIN, OUTPUT);
+    pinMode(RECORDING_LED_PIN, OUTPUT);
+
+    attachInterrupt(digitalPinToInterrupt(BUTTON_PIN), handleButtonInterrupt, CHANGE);
 
     // Initialize IMU
     if (!SetupIMU()) {
@@ -427,7 +335,7 @@ void setup() {
 
     oled_display_clear();
     oled_display_text(0, 10, "GAINS");
-    oled_display_text(0, 30, "Ready!");
+    oled_display_text(0, 30, "Press button to start recording.");
     oled_display_update();
 
     // Clear any serial data sent during connection (shell prompts, etc)
@@ -444,27 +352,53 @@ void setup() {
 void loop() {
     // Handle button state changes
     bool currentState = buttonState;
-    digitalWrite(ledPin, currentState ? HIGH : LOW);
 
+    // Only update OLED if the button state has changed
     if (currentState != lastButtonState) {
         lastButtonState = currentState;
-        lastOLEDUpdate = millis();
+        lastOLEDUpdate = millis();  // reset OLED timer
+        // Print button/LED state for debugging
+        Serial.printf("Button: %s, LED: %s\n",
+                  currentState ? "HIGH" : "LOW",
+                  currentState ? "ON" : "OFF");
 
         if (currentState == HIGH) {
+            // Toggle inference state
             inferenceEnabled = !inferenceEnabled;
 
             if (inferenceEnabled) {
-                Serial.println("\n[INFERENCE STARTED]");
+                // OLED update for button pressed
                 oled_display_clear();
                 oled_display_text(0, 10, "GAINS");
-                oled_display_text(0, 30, "Running...");
+                oled_display_text(0, 30, "Started recording. Press button to stop.");
                 oled_display_update();
+
+                // LED is on while recording
+                digitalWrite(RECORDING_LED_PIN, HIGH);
+
+                // Buzz tone to indicate start (two beeps)
+                tone(BUZZER_PIN, NOTE_D4, 100);
+                delay(100);
+                noTone(BUZZER_PIN);
+                delay(50);
+                tone(BUZZER_PIN, NOTE_D4, 100);
+                delay(100);
+                noTone(BUZZER_PIN);
+
             } else {
-                Serial.println("\n[INFERENCE STOPPED]");
+                // OLED update for stopping recording
                 oled_display_clear();
                 oled_display_text(0, 10, "GAINS");
-                oled_display_text(0, 30, "Stopped");
+                oled_display_text(0, 30, "Stopped Recording. Press button to start again.");
                 oled_display_update();
+
+                // LED is off while not recording
+                digitalWrite(RECORDING_LED_PIN, LOW);
+
+                // Buzz tone to indicate stop
+                tone(BUZZER_PIN, NOTE_C4, 200);
+                delay(200);
+                noTone(BUZZER_PIN);
             }
         }
     }
@@ -472,6 +406,10 @@ void loop() {
     // Handle serial input
     if (Serial.available() > 0) {
         char key = Serial.read();
+        // Clear any remaining characters
+        while (Serial.available() > 0) {
+            Serial.read();
+        }
         Serial.printf("Key pressed: '%c' (0x%02X)\n", key, key);
 
         inferenceEnabled = !inferenceEnabled;
