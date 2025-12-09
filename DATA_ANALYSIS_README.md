@@ -13,7 +13,7 @@ The notebook analyzes accelerometer and gyroscope data from push-up sessions to:
 ## Dataset Structure
 
 **Input Data:**
-- JSON files from `raw_dataset/pushup_data_*.json`
+- JSON files from `dataset_raw/pushup_data_*.json`
 - Each file contains multiple sessions with labeled push-up data
 - Sample rate: 40 Hz
 - Sensor placement: Sternum (chest)
@@ -39,7 +39,7 @@ pip install pandas numpy matplotlib seaborn
 
 ## How to Use
 
-1. **Place your data files** in the `raw_dataset/` directory
+1. **Place your data files** in the `dataset_raw/` directory
    - Files should match pattern: `pushup_data_*.json`
    - Or modify the glob pattern in Cell 3 to point to your data
 
@@ -175,7 +175,7 @@ session_stats.to_csv('session_statistics.csv', index=False)
 ## Troubleshooting
 
 **Issue: "No JSON files found"**
-- Ensure files are in `raw_dataset/` directory
+- Ensure files are in `dataset_raw/` directory
 - Check the glob pattern in Cell 3 matches your filenames
 
 **Issue: "Module not found"**
@@ -203,7 +203,7 @@ After analyzing your data:
 - `DATA_COLLECTOR_README.md`: How to collect IMU data
 - `MODEL_TRAINING_GUIDE.md`: How to train the classification model
 - `pushup_model_colab.ipynb`: Model training notebook
-- `raw_dataset/`: Directory containing collected data files
+- `dataset_raw/`: Directory containing collected data files
 
 ## Technical Details
 
