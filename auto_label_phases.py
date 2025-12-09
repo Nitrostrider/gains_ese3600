@@ -1,330 +1,680 @@
-#!/usr/bin/env python3
-"""
-Auto-Label Phase Data for Pushup Detection
-
-This script processes existing pushup training data and automatically labels
-the phase (at-top, moving, at-bottom) based on IMU sensor patterns.
-
-Usage:
-    python auto_label_phases.py
-
-The script will:
-1. Read all JSON files from pushup_data/ directory
-2. Analyze IMU data (accelerometer Z-axis primarily)
-3. Auto-label phase for each data window
-4. Generate phase-labeled dataset for multi-task model training
-"""
-
 import json
-import os
 import numpy as np
-from pathlib import Path
-from typing import Dict, List, Tuple
+import os
+import glob
+import matplotlib.pyplot as plt
 
 
-def auto_label_phase(window: np.ndarray) -> str:
+###############################################################################
+# Utility Functions
+###############################################################################
+def smooth(x, k=5):
     """
-    Auto-label pushup phase based on IMU patterns.
+    Smooth a signal using a simple moving average.
 
     Args:
-        window: numpy array of shape (n_samples, 6) containing [ax, ay, az, gx, gy, gz]
+        x: Input signal array
+        k: Kernel size for smoothing (default: 5)
+
+    Returns:
+        Smoothed signal array
+    """
+    if len(x) < k:
+        return x
+    kernel = np.ones(k) / k
+    return np.convolve(x, kernel, mode="same")
+
+
+def gaussian_smooth(x, sigma=2):
+    """
+    Smooth a signal using Gaussian filter.
+
+    Args:
+        x: Input signal array
+        sigma: Standard deviation of Gaussian kernel
+
+    Returns:
+        Smoothed signal array
+    """
+    if len(x) < 3:
+        return x
+
+    # Create Gaussian kernel
+    kernel_size = int(4 * sigma + 1)
+    if kernel_size % 2 == 0:
+        kernel_size += 1
+
+    kernel_half = kernel_size // 2
+    kernel = np.exp(-np.arange(-kernel_half, kernel_half + 1)**2 / (2 * sigma**2))
+    kernel = kernel / np.sum(kernel)
+
+    return np.convolve(x, kernel, mode="same")
+
+
+###############################################################################
+# Phase Labeling
+###############################################################################
+def auto_label_phase(window: np.ndarray, debug=False) -> str:
+    """
+    Automatically label pushup phase based on IMU data.
+
+    Three phase classification: at-top, moving, at-bottom
+
+    IMPORTANT: The positive Z-axis of the accelerometer points DOWN toward
+    the ground (placed on sternum pointing toward floor).
+
+    Based on Z-position integration analysis:
+    - at-top: Z-position is at zero (sternum highest, plank position)
+              → Z-acceleration is at plateau (around 0.8-1.0g)
+              → Low variance in az, low gyro activity
+    - at-bottom: Z-position is at minimum (sternum lowest, chest near ground)
+                 → Z-acceleration is at peak (around 1.3-1.5g)
+                 → Momentary high acceleration, low gyro activity
+    - moving: Z-position is changing (descent or ascent)
+              → Z-acceleration is at valley (around 0.4-0.7g)
+              → High variance, high gyro activity, or low az values
+
+    Args:
+        window: (N, 6) numpy array containing [ax, ay, az, gx, gy, gz]
 
     Returns:
         Phase label: "at-top", "moving", or "at-bottom"
-
-    Heuristic Logic:
-        - High Z-axis acceleration (~0.9-1.0 g) with low variance = at-top
-        - Low Z-axis acceleration (~0.4-0.6 g) with low variance = at-bottom
-        - Everything else (transitioning, high variance) = moving
     """
-    # Extract Z-axis acceleration (index 2)
-    az = window[:, 2]
+    window = np.asarray(window)
 
-    # Calculate statistics
-    az_mean = np.mean(az)
-    az_std = np.std(az)
-    az_max = np.max(az)
-    az_min = np.min(az)
+    # Apply stronger smoothing for better plateau/peak/valley detection
+    az = gaussian_smooth(window[:, 2], sigma=5)  # Z-acceleration with Gaussian smoothing (increased from 3)
+    gy = gaussian_smooth(window[:, 4], sigma=3)  # Y-gyroscope (increased from 2)
 
-    # Calculate velocity (derivative of position ~ integral of acceleration)
-    # Approximate velocity by looking at change in az over time
-    az_velocity = np.diff(az)  # Change in acceleration between samples
+    # Calculate statistical features
+    az_mean = float(np.mean(az))
+    az_median = float(np.median(az))
+    az_std = float(np.std(az))
+    az_min = float(np.min(az))
+    az_max = float(np.max(az))
 
-    # Detect direction changes: look for zero-crossings in velocity
-    # At top/bottom, velocity should reverse (go from +/- to -/+)
-    velocity_sign_changes = np.sum(np.diff(np.sign(az_velocity)) != 0)
+    gy_std = float(np.std(gy))
+    gy_max_abs = float(np.max(np.abs(gy)))
 
-    # Check if there's a clear peak or valley in the window
-    peak_index = np.argmax(az)  # Index of highest acceleration
-    valley_index = np.argmin(az)  # Index of lowest acceleration
+    # Thresholds based on empirical analysis of Z-position graphs
+    # These are tuned to match the plateau/valley/peak patterns
 
-    # Peak/valley is clearer if it's in the middle of the window (not at edges)
-    peak_in_middle = 10 < peak_index < 40  # Not in first/last 10 samples
-    valley_in_middle = 10 < valley_index < 40
+    # Acceleration ranges (more refined)
+    VALLEY_MAX = 0.70           # Moving phase shows valleys below this
+    PLATEAU_MIN = 0.72          # Top plateau starts here
+    PLATEAU_MAX = 1.10          # Top plateau ends here
+    PEAK_MIN = 1.12             # Bottom peak starts here
 
-    # Thresholds - carefully tuned to distinguish top vs bottom
-    TOP_MEAN_MIN = 0.80          # Mean az must be high for top
-    BOTTOM_MEAN_MAX = 0.70       # Mean az must be low for bottom
-    STABLE_THRESHOLD = 0.20      # Std threshold for stable position
-    TOP_PEAK_MIN = 0.85          # Peak value indicating top position
-    BOTTOM_VALLEY_MAX = 0.60     # Valley value indicating bottom position
+    # Stability thresholds
+    STABLE_STD_MAX = 0.10       # Low variance indicates stable position
+    HIGH_VARIANCE_MIN = 0.15    # High variance indicates movement
+    STATIC_GY_MAX = 15.0        # Low gyro = static position
+    MOVING_GY_MIN = 20.0        # High gyro = definitely moving
 
-    # Classification logic - mutually exclusive checks
-    # Check for at-top: high mean AND (low variance OR peak in middle OR direction change)
-    is_high_mean = az_mean > TOP_MEAN_MIN
-    is_stable = az_std < STABLE_THRESHOLD
-    has_top_peak = az_max > TOP_PEAK_MIN
+    # Decision logic based on signal characteristics
 
-    if is_high_mean and has_top_peak:
-        # Strong indicator of top position
-        if is_stable or peak_in_middle or velocity_sign_changes >= 2:
-            return "at-top"
+    # RULE 1: Clear valley in acceleration = moving
+    if az_mean < VALLEY_MAX or az_median < VALLEY_MAX:
+        if debug:
+            print(f"  RULE 1 (Valley): az_mean={az_mean:.3f}, az_median={az_median:.3f} < {VALLEY_MAX} → moving")
+        return "moving"
 
-    # Check for at-bottom: low mean AND (low variance OR valley in middle OR direction change)
-    is_low_mean = az_mean < BOTTOM_MEAN_MAX
-    has_bottom_valley = az_min < BOTTOM_VALLEY_MAX
-
-    if is_low_mean and has_bottom_valley:
-        # Strong indicator of bottom position
-        if is_stable or valley_in_middle or velocity_sign_changes >= 2:
-            return "at-bottom"
-
-    # Fallback: stable positions based on mean alone (stricter thresholds)
-    if az_mean > 0.85 and az_std < 0.15:
-        return "at-top"
-    elif az_mean < 0.65 and az_std < 0.15:
+    # RULE 2: Clear peak in acceleration = at-bottom
+    if az_mean >= PEAK_MIN and az_median >= PEAK_MIN:
+        if debug:
+            print(f"  RULE 2 (Peak): az_mean={az_mean:.3f}, az_median={az_median:.3f} >= {PEAK_MIN} → at-bottom")
         return "at-bottom"
 
-    # Default: moving (transitioning between positions)
-    return "moving"
+    # RULE 3: High gyro activity = moving (regardless of acceleration)
+    if gy_max_abs > MOVING_GY_MIN or gy_std > 10.0:
+        if debug:
+            print(f"  RULE 3 (High Gyro): gy_max={gy_max_abs:.1f}, gy_std={gy_std:.1f} → moving")
+        return "moving"
+
+    # RULE 4: Stable plateau with low variance = at-top
+    if (PLATEAU_MIN <= az_mean <= PLATEAU_MAX and
+        PLATEAU_MIN <= az_median <= PLATEAU_MAX and
+        az_std < STABLE_STD_MAX and
+        gy_max_abs < STATIC_GY_MAX):
+        if debug:
+            print(f"  RULE 4 (Plateau): az_mean={az_mean:.3f}, az_std={az_std:.3f}, gy_max={gy_max_abs:.1f} → at-top")
+        return "at-top"
+
+    # RULE 5: High variance indicates movement
+    if az_std > HIGH_VARIANCE_MIN:
+        if debug:
+            print(f"  RULE 5 (High Variance): az_std={az_std:.3f} > {HIGH_VARIANCE_MIN} → moving")
+        return "moving"
+
+    # RULE 6: Use mean to decide between remaining cases
+    if az_mean >= PEAK_MIN:
+        if debug:
+            print(f"  RULE 6 (Fallback Peak): az_mean={az_mean:.3f} >= {PEAK_MIN} → at-bottom")
+        return "at-bottom"
+    elif PLATEAU_MIN <= az_mean <= PLATEAU_MAX:
+        if debug:
+            print(f"  RULE 6 (Fallback Plateau): az_mean={az_mean:.3f} in [{PLATEAU_MIN}, {PLATEAU_MAX}] → at-top")
+        return "at-top"
+    else:
+        # Default to moving for ambiguous cases
+        if debug:
+            print(f"  RULE 6 (Fallback Default): az_mean={az_mean:.3f} → moving")
+        return "moving"
 
 
-def load_session_data(json_path: str) -> List[Dict]:
-    """Load a single training session JSON file and return list of sessions."""
-    with open(json_path, 'r') as f:
-        data = json.load(f)
-        # Handle new format with 'sessions' array
-        if 'sessions' in data:
-            return data['sessions']
-        else:
-            # Old format - single session
-            return [data]
-
-
-def create_windows_with_phase_labels(
-    session: Dict,
-    window_size: int = 50,
-    stride: int = 10
-) -> List[Tuple[np.ndarray, str, str]]:
+###############################################################################
+# Data Loading Functions
+###############################################################################
+def load_true_json_format(json_path: str):
     """
-    Create sliding windows with both posture and phase labels.
+    Load and flatten all sessions from JSON file.
+
+    Expected JSON format:
+    {
+      "metadata": {...},
+      "sessions": [
+         {
+           "session_id": ...,
+           "data": [
+             {"ax":..., "ay":..., "az":..., "gx":..., "gy":..., "gz":...},
+             ...
+           ]
+         },
+         ...
+      ]
+    }
 
     Args:
-        session: Dictionary containing IMU data and labels
-        window_size: Number of samples per window (default: 50 @ 40Hz = 1.25s)
-        stride: Step size for sliding window (default: 10 samples)
+        json_path: Path to JSON file
 
     Returns:
-        List of tuples: (window_data, posture_label, phase_label)
+        all_imu: Flattened (N, 6) numpy array of IMU data
+        session_ranges: List of (start, end) tuples for each session
     """
-    # Extract IMU data from list of dictionaries
-    # Each sample is: {'ax': ..., 'ay': ..., 'az': ..., 'gx': ..., 'gy': ..., 'gz': ...}
-    raw_data = session['data']
+    with open(json_path, "r") as f:
+        raw = json.load(f)
 
-    # Convert to numpy array: (n_samples, 6) with columns [ax, ay, az, gx, gy, gz]
-    imu_data = np.array([
-        [sample['ax'], sample['ay'], sample['az'],
-         sample['gx'], sample['gy'], sample['gz']]
-        for sample in raw_data
-    ])
+    all_imu = []
+    session_ranges = []
 
-    posture_label = session['posture_label']
+    for session in raw["sessions"]:
+        data = session["data"]
 
-    windows = []
+        # Extract each axis
+        ax = [d["ax"] for d in data]
+        ay = [d["ay"] for d in data]
+        az = [d["az"] for d in data]
+        gx = [d["gx"] for d in data]
+        gy = [d["gy"] for d in data]
+        gz = [d["gz"] for d in data]
 
-    # Create sliding windows
-    for i in range(0, len(imu_data) - window_size + 1, stride):
-        window = imu_data[i:i+window_size]
+        imu = np.stack([ax, ay, az, gx, gy, gz], axis=1)
 
-        # Auto-label phase
-        phase_label = auto_label_phase(window)
+        start = len(all_imu)
+        end = start + len(imu)
+        session_ranges.append((start, end))
 
-        windows.append((window, posture_label, phase_label))
+        all_imu.extend(imu)
 
-    return windows
+    return np.array(all_imu), session_ranges
 
 
-def process_all_sessions(data_dir: str) -> Dict[str, List]:
+def load_single_session(json_path: str, session_id: int):
     """
-    Process all JSON files in the data directory.
+    Load a specific session from JSON file.
 
     Args:
-        data_dir: Path to directory containing JSON session files
+        json_path: Path to JSON file
+        session_id: ID of the session to load
 
     Returns:
-        Dictionary containing all labeled windows and statistics
+        imu: (N, 6) numpy array containing [ax, ay, az, gx, gy, gz]
+
+    Raises:
+        ValueError: If session_id is not found
     """
-    data_path = Path(data_dir)
+    with open(json_path, "r") as f:
+        raw = json.load(f)
 
-    if not data_path.exists():
-        raise FileNotFoundError(f"Data directory not found: {data_dir}")
+    # Find the correct session
+    for session in raw["sessions"]:
+        if session["session_id"] == session_id:
+            data = session["data"]
 
-    # Find all JSON files
-    json_files = list(data_path.glob("pushup_data_20251204*.json"))
+            ax = [d["ax"] for d in data]
+            ay = [d["ay"] for d in data]
+            az = [d["az"] for d in data]
+            gx = [d["gx"] for d in data]
+            gy = [d["gy"] for d in data]
+            gz = [d["gz"] for d in data]
 
-    if not json_files:
-        raise FileNotFoundError(f"No JSON files found in {data_dir}")
+            imu = np.stack([ax, ay, az, gx, gy, gz], axis=1)
+            return imu
 
-    print(f"Found {len(json_files)} session files")
+    raise ValueError(f"Session ID {session_id} not found.")
 
+
+def load_all_json_files(raw_dataset_dir: str):
+    """
+    Load all JSON files from the raw dataset directory.
+
+    Args:
+        raw_dataset_dir: Path to directory containing JSON files
+
+    Returns:
+        all_sessions: List of tuples (filename, session_data_dict)
+    """
+    json_files = sorted(glob.glob(os.path.join(raw_dataset_dir, "*.json")))
+    all_sessions = []
+
+    for json_file in json_files:
+        with open(json_file, "r") as f:
+            data = json.load(f)
+            filename = os.path.basename(json_file)
+            all_sessions.append((filename, data))
+
+    return all_sessions
+
+
+###############################################################################
+# Processing Functions
+###############################################################################
+def process_session(json_path: str, window_size=40, step_size=20):
+    """
+    Process all sessions using sliding window approach.
+
+    Args:
+        json_path: Path to JSON file
+        window_size: Size of sliding window (default: 40)
+        step_size: Step size for sliding window (default: 20)
+
+    Returns:
+        imu: Full IMU data array
+        centers: List of window center indices
+        labels: List of phase labels
+    """
+    imu, _ = load_true_json_format(json_path)
+
+    labels = []
+    centers = []
+
+    i = 0
+    while i + window_size <= len(imu):
+        window = imu[i:i + window_size]
+        phase = auto_label_phase(window)
+        labels.append(phase)
+        centers.append(i + window_size // 2)
+        i += step_size
+
+    return imu, centers, labels
+
+
+def process_one_session(imu, window_size=40, step_size=20):
+    """
+    Process a single session using sliding window approach.
+
+    Args:
+        imu: (N, 6) numpy array of IMU data
+        window_size: Size of sliding window (default: 40)
+        step_size: Step size for sliding window (default: 20)
+
+    Returns:
+        centers: List of window center indices
+        labels: List of phase labels
+    """
+    labels = []
+    centers = []
+
+    i = 0
+    while i + window_size <= len(imu):
+        window = imu[i:i + window_size]
+        phase = auto_label_phase(window)
+        labels.append(phase)
+        centers.append(i + window_size // 2)
+        i += step_size
+
+    return centers, labels
+
+
+def process_all_files_to_windows(raw_dataset_dir: str, window_size=40, step_size=20):
+    """
+    Process all JSON files and create labeled windows.
+
+    Args:
+        raw_dataset_dir: Path to directory containing raw JSON files
+        window_size: Size of sliding window (default: 40)
+        step_size: Step size for sliding window (default: 20)
+
+    Returns:
+        labeled_data: Dictionary containing metadata and labeled windows
+    """
+    all_sessions = load_all_json_files(raw_dataset_dir)
     all_windows = []
     phase_counts = {"at-top": 0, "moving": 0, "at-bottom": 0}
     posture_counts = {}
+    file_stats = []
 
-    # Process each JSON file
-    for json_file in json_files:
-        try:
-            sessions = load_session_data(str(json_file))
-            file_window_count = 0
+    print(f"Processing {len(all_sessions)} JSON files...")
+    print()
 
-            # Process each session in the file
-            for session in sessions:
-                windows = create_windows_with_phase_labels(session)
+    total_sessions = 0
+    for filename, session_data in all_sessions:
+        file_phase_counts = {"at-top": 0, "moving": 0, "at-bottom": 0}
+        file_windows = 0
 
-                # Collect statistics
-                for window, posture, phase in windows:
-                    all_windows.append({
-                        'window': window.tolist(),
-                        'posture_label': posture,
-                        'phase_label': phase
-                    })
+        for session in session_data["sessions"]:
+            total_sessions += 1
+            data = session["data"]
 
-                    phase_counts[phase] += 1
-                    posture_counts[posture] = posture_counts.get(posture, 0) + 1
+            # Extract IMU data
+            ax = [d["ax"] for d in data]
+            ay = [d["ay"] for d in data]
+            az = [d["az"] for d in data]
+            gx = [d["gx"] for d in data]
+            gy = [d["gy"] for d in data]
+            gz = [d["gz"] for d in data]
 
-                file_window_count += len(windows)
+            imu = np.stack([ax, ay, az, gx, gy, gz], axis=1)
 
-            print(f"  ✓ Processed {json_file.name}: {len(sessions)} sessions, {file_window_count} windows")
+            # Get original posture label from session
+            posture_label = session.get("posture_label", "unknown")
 
-        except Exception as e:
-            print(f"  ✗ Error processing {json_file.name}: {e}")
-            import traceback
-            traceback.print_exc()
-            continue
+            # Count postures
+            if posture_label not in posture_counts:
+                posture_counts[posture_label] = 0
 
-    print(f"\n=== Dataset Statistics ===")
-    print(f"Total windows: {len(all_windows)}")
-    print(f"\nPhase distribution:")
-    for phase, count in phase_counts.items():
-        pct = (count / len(all_windows)) * 100
-        print(f"  {phase:12s}: {count:4d} ({pct:5.1f}%)")
+            # Create sliding windows
+            i = 0
+            while i + window_size <= len(imu):
+                window = imu[i:i + window_size]
+                phase_label = auto_label_phase(window)
 
-    print(f"\nPosture distribution:")
-    for posture, count in sorted(posture_counts.items()):
-        pct = (count / len(all_windows)) * 100
-        print(f"  {posture:15s}: {count:4d} ({pct:5.1f}%)")
+                window_dict = {
+                    "window": window.tolist(),
+                    "posture_label": posture_label,
+                    "phase_label": phase_label
+                }
 
-    return {
-        'windows': all_windows,
-        'phase_counts': phase_counts,
-        'posture_counts': posture_counts,
-        'total_count': len(all_windows)
-    }
+                all_windows.append(window_dict)
+                phase_counts[phase_label] += 1
+                posture_counts[posture_label] += 1
+                file_phase_counts[phase_label] += 1
+                file_windows += 1
 
+                i += step_size
 
-def validate_auto_labels(
-    dataset: Dict,
-    sample_size: int = 10
-) -> None:
-    """
-    Print sample windows for manual validation of auto-labeling.
+        # Print file statistics
+        print(f"  {filename}:")
+        print(f"    Windows: {file_windows}")
+        print(f"    at-top: {file_phase_counts['at-top']} ({100*file_phase_counts['at-top']/max(file_windows,1):.1f}%)")
+        print(f"    moving: {file_phase_counts['moving']} ({100*file_phase_counts['moving']/max(file_windows,1):.1f}%)")
+        print(f"    at-bottom: {file_phase_counts['at-bottom']} ({100*file_phase_counts['at-bottom']/max(file_windows,1):.1f}%)")
+        print()
 
-    Args:
-        dataset: Dataset dictionary from process_all_sessions()
-        sample_size: Number of random samples to display
-    """
-    print(f"\n=== Validation Samples (Random {sample_size}) ===")
+        file_stats.append({
+            "filename": filename,
+            "windows": file_windows,
+            "phase_distribution": file_phase_counts
+        })
 
-    windows = dataset['windows']
-    indices = np.random.choice(len(windows), min(sample_size, len(windows)), replace=False)
-
-    for idx in indices:
-        w = windows[idx]
-        window_data = np.array(w['window'])
-        az_mean = np.mean(window_data[:, 2])
-        az_std = np.std(window_data[:, 2])
-
-        print(f"\nSample {idx}:")
-        print(f"  Posture: {w['posture_label']}")
-        print(f"  Phase: {w['phase_label']}")
-        print(f"  az_mean: {az_mean:.3f}, az_std: {az_std:.3f}")
-
-
-def save_labeled_dataset(
-    dataset: Dict,
-    output_path: str = "pushup_data_phase_labeled.json"
-) -> None:
-    """
-    Save the phase-labeled dataset to a JSON file.
-
-    Args:
-        dataset: Dataset dictionary from process_all_sessions()
-        output_path: Path for output JSON file
-    """
-    output = {
-        'metadata': {
-            'window_size': 50,
-            'stride': 10,
-            'total_windows': dataset['total_count'],
-            'phase_counts': dataset['phase_counts'],
-            'posture_counts': dataset['posture_counts'],
-            'phase_labels': ['at-top', 'moving', 'at-bottom'],
-            'posture_labels': ['good-form', 'hips-high', 'hips-sagging', 'partial-rom']
+    # Create output structure
+    labeled_data = {
+        "metadata": {
+            "window_size": window_size,
+            "stride": step_size,
+            "total_windows": len(all_windows),
+            "total_sessions": total_sessions,
+            "total_files": len(all_sessions),
+            "phase_counts": phase_counts,
+            "posture_counts": posture_counts,
+            "phase_labels": ["at-top", "moving", "at-bottom"],
+            "posture_labels": list(posture_counts.keys()),
+            "file_statistics": file_stats
         },
-        'windows': dataset['windows']
+        "windows": all_windows
     }
 
-    with open(output_path, 'w') as f:
-        json.dump(output, f, indent=2)
-
-    print(f"\n✓ Saved labeled dataset to {output_path}")
-    print(f"  File size: {os.path.getsize(output_path) / (1024*1024):.1f} MB")
+    return labeled_data
 
 
-def main():
-    """Main execution function."""
-    print("=" * 60)
-    print("Auto-Label Phase Data for Pushup Detection")
-    print("=" * 60)
+###############################################################################
+# Visualization Functions
+###############################################################################
+def plot_session_with_labels(imu, centers, labels):
+    """
+    Plot IMU data with phase labels overlay (all sessions).
+
+    Args:
+        imu: (N, 6) numpy array of IMU data
+        centers: List of window center indices
+        labels: List of phase labels
+    """
+    az = imu[:, 2]
+    t = np.arange(len(az))
+
+    colors = {
+        "at-top": "blue",
+        "moving": "orange",
+        "at-bottom": "red"
+    }
+
+    plt.figure(figsize=(14, 6))
+    plt.plot(t, az, label="az", color="black")
+
+    px = []
+    py = []
+    pc = []
+    for c, lab in zip(centers, labels):
+        if c < len(az):
+            px.append(c)
+            py.append(az[c])
+            pc.append(colors[lab])
+
+    plt.scatter(px, py, c=pc, s=40)
+
+    for lab, col in colors.items():
+        plt.scatter([], [], c=col, s=40, label=lab)
+
+    plt.xlabel("Sample index")
+    plt.ylabel("az (accel Z)")
+    plt.title("Pushup Phase Labels Overlay")
+    plt.legend()
+    plt.grid(alpha=0.3)
+    plt.show()
+
+
+def plot_single_session(imu, centers, labels, show_smoothed=True, show_thresholds=True):
+    """
+    Plot IMU data with phase labels overlay (single session).
+
+    Args:
+        imu: (N, 6) numpy array of IMU data
+        centers: List of window center indices
+        labels: List of phase labels
+        show_smoothed: Whether to show smoothed signal overlay
+        show_thresholds: Whether to show classification threshold lines
+    """
+    az_raw = imu[:, 2]
+    t = np.arange(len(az_raw))
+
+    # Apply the same smoothing used in classification
+    az_smoothed = gaussian_smooth(az_raw, sigma=5)
+
+    colors = {
+        "at-top": "blue",
+        "moving": "orange",
+        "at-bottom": "red"
+    }
+
+    # Thresholds from auto_label_phase function
+    VALLEY_MAX = 0.70
+    PLATEAU_MIN = 0.72
+    PLATEAU_MAX = 1.10
+    PEAK_MIN = 1.12
+
+    plt.figure(figsize=(16, 8))
+
+    # Plot raw signal
+    plt.plot(t, az_raw, label="az (raw)", color="lightgray", linewidth=1, alpha=0.7)
+
+    # Plot smoothed signal
+    if show_smoothed:
+        plt.plot(t, az_smoothed, label="az (smoothed)", color="black", linewidth=2)
+
+    # Plot threshold lines
+    if show_thresholds:
+        plt.axhline(y=VALLEY_MAX, color='orange', linestyle='--', linewidth=1.5,
+                   alpha=0.6, label=f'Valley Max ({VALLEY_MAX}g) - Moving')
+        plt.axhline(y=PLATEAU_MIN, color='blue', linestyle='--', linewidth=1.5,
+                   alpha=0.6, label=f'Plateau Range ({PLATEAU_MIN}-{PLATEAU_MAX}g) - At Top')
+        plt.axhline(y=PLATEAU_MAX, color='blue', linestyle='--', linewidth=1.5, alpha=0.6)
+        plt.axhline(y=PEAK_MIN, color='red', linestyle='--', linewidth=1.5,
+                   alpha=0.6, label=f'Peak Min ({PEAK_MIN}g) - At Bottom')
+
+    # Plot classification labels
+    px, py, col = [], [], []
+    for c, lab in zip(centers, labels):
+        if c < len(az_smoothed):
+            px.append(c)
+            py.append(az_smoothed[c])  # Use smoothed value for label placement
+            col.append(colors[lab])
+
+    plt.scatter(px, py, c=col, s=60, edgecolors='black', linewidth=1.5, zorder=5)
+
+    # Add legend for labels
+    for lab, c in colors.items():
+        plt.scatter([], [], c=c, s=60, edgecolors='black', linewidth=1.5, label=lab)
+
+    plt.title("Phase Labels for Selected Session (with Smoothing & Thresholds)", fontsize=14)
+    plt.xlabel("Sample Index", fontsize=12)
+    plt.ylabel("Accelerometer Z (g)", fontsize=12)
+    plt.grid(alpha=0.3)
+    plt.legend(loc='best', fontsize=10)
+    plt.tight_layout()
+    plt.show()
+
+    # Print statistics
+    print(f"\nSignal Statistics:")
+    print(f"  Raw az:      min={az_raw.min():.3f}, max={az_raw.max():.3f}, mean={az_raw.mean():.3f}, std={az_raw.std():.3f}")
+    print(f"  Smoothed az: min={az_smoothed.min():.3f}, max={az_smoothed.max():.3f}, mean={az_smoothed.mean():.3f}, std={az_smoothed.std():.3f}")
+    print(f"\nLabel Distribution:")
+    label_counts = {lab: labels.count(lab) for lab in set(labels)}
+    total = len(labels)
+    for lab in ["at-top", "moving", "at-bottom"]:
+        count = label_counts.get(lab, 0)
+        print(f"  {lab:12s}: {count:3d} ({100*count/total:5.1f}%)")
+
+
+###############################################################################
+# Main
+###############################################################################
+if __name__ == "__main__":
+    import sys
 
     # Configuration
-    DATA_DIR = "preprocessed_dataset"  # Use preprocessed data
+    RAW_DATASET_DIR = "raw_dataset"
     OUTPUT_FILE = "pushup_data_phase_labeled.json"
+    WINDOW_SIZE = 60  # Increased from 40 (1.5 seconds @ 40Hz)
+    STEP_SIZE = 20    # Keep overlap for better coverage
 
-    try:
-        # Process all sessions
-        dataset = process_all_sessions(DATA_DIR)
+    # Usage:
+    # 1. Visualize a single session: python3 auto_label_phases.py --visualize [session_id]
+    # 2. Visualize with debug info: python3 auto_label_phases.py --visualize [session_id] --debug
+    # 3. Process all files: python3 auto_label_phases.py
 
-        # Validate auto-labeling
-        validate_auto_labels(dataset, sample_size=10)
+    # Check if user wants to visualize a single session
+    if len(sys.argv) > 1 and sys.argv[1] == "--visualize":
+        # Visualization mode
+        json_path = "raw_dataset/pushup_data_20251204_181709.json"
+        SESSION_TO_ANALYZE = 0
+        DEBUG_MODE = False
 
-        # Save labeled dataset
-        save_labeled_dataset(dataset, OUTPUT_FILE)
+        # Parse arguments
+        for i, arg in enumerate(sys.argv[2:], start=2):
+            if arg == "--debug":
+                DEBUG_MODE = True
+            else:
+                try:
+                    SESSION_TO_ANALYZE = int(arg)
+                except ValueError:
+                    pass
 
-        print("\n" + "=" * 60)
-        print("✓ Phase labeling complete!")
-        print("=" * 60)
-        print("\nNext steps:")
-        print("1. Review validation samples above")
-        print("2. Manually check 10% of labels if needed")
-        print(f"3. Use {OUTPUT_FILE} for multi-task model training")
+        print(f"Loading session {SESSION_TO_ANALYZE} for visualization...")
+        print(f"Window size: {WINDOW_SIZE}, Step size: {STEP_SIZE}")
+        print(f"Debug mode: {DEBUG_MODE}\n")
 
-    except Exception as e:
-        print(f"\n✗ Error: {e}")
-        return 1
+        imu = load_single_session(json_path, SESSION_TO_ANALYZE)
 
-    return 0
+        # Process with optional debug output
+        if DEBUG_MODE:
+            print("Classification debug output:")
+            labels = []
+            centers = []
+            i = 0
+            window_num = 0
+            while i + WINDOW_SIZE <= len(imu):
+                window = imu[i:i + WINDOW_SIZE]
+                center = i + WINDOW_SIZE // 2
+                print(f"\nWindow {window_num} (center={center}):")
+                phase = auto_label_phase(window, debug=True)
+                labels.append(phase)
+                centers.append(center)
+                i += STEP_SIZE
+                window_num += 1
+        else:
+            centers, labels = process_one_session(imu, WINDOW_SIZE, STEP_SIZE)
 
+        plot_single_session(imu, centers, labels)
+        print(f"\nFinished labeling session {SESSION_TO_ANALYZE}.")
+        print(f"To see classification details, run with: --visualize {SESSION_TO_ANALYZE} --debug")
 
-if __name__ == "__main__":
-    exit(main())
+    else:
+        # Full processing mode
+        print("=" * 70)
+        print("Auto-labeling all pushup data with phase labels")
+        print("=" * 70)
+        print(f"Raw dataset directory: {RAW_DATASET_DIR}")
+        print(f"Output file: {OUTPUT_FILE}")
+        print(f"Window size: {WINDOW_SIZE}")
+        print(f"Step size: {STEP_SIZE}")
+        print()
+
+        # Process all files
+        labeled_data = process_all_files_to_windows(
+            RAW_DATASET_DIR,
+            window_size=WINDOW_SIZE,
+            step_size=STEP_SIZE
+        )
+
+        # Save to JSON
+        print(f"\nSaving labeled data to {OUTPUT_FILE}...")
+        with open(OUTPUT_FILE, "w") as f:
+            json.dump(labeled_data, f, indent=2)
+
+        print("=" * 70)
+        print("Processing complete!")
+        print("=" * 70)
+        print(f"\nDataset Statistics:")
+        print(f"  Total files processed: {labeled_data['metadata']['total_files']}")
+        print(f"  Total sessions: {labeled_data['metadata']['total_sessions']}")
+        print(f"  Total windows created: {labeled_data['metadata']['total_windows']}")
+        print(f"  Window size: {labeled_data['metadata']['window_size']}")
+        print(f"  Stride: {labeled_data['metadata']['stride']}")
+
+        print(f"\nPhase Label Distribution:")
+        total_windows = labeled_data['metadata']['total_windows']
+        for phase in ["at-top", "moving", "at-bottom"]:
+            count = labeled_data['metadata']['phase_counts'][phase]
+            percentage = (count / total_windows) * 100
+            bar_length = int(percentage / 2)
+            bar = "█" * bar_length
+            print(f"  {phase:12s}: {count:5d} ({percentage:5.1f}%) {bar}")
+
+        print(f"\nPosture Label Distribution:")
+        for posture, count in sorted(labeled_data['metadata']['posture_counts'].items()):
+            percentage = (count / total_windows) * 100
+            bar_length = int(percentage / 2)
+            bar = "█" * bar_length
+            print(f"  {posture:12s}: {count:5d} ({percentage:5.1f}%) {bar}")
+
+        print(f"\nOutput saved to: {OUTPUT_FILE}")

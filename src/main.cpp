@@ -99,6 +99,34 @@ RepCounter rep_counter = {0, 0, 0, STATE_IDLE, 0, 0, 0, 0};
 
 const unsigned long STATE_TIMEOUT_MS = 10000;  // 10 seconds
 
+// ===== PUSHUP CYCLE TRACKING FOR PREDICTION AGGREGATION =====
+enum PushupCycleState {
+    CYCLE_IDLE,          // No pushup in progress
+    CYCLE_IN_PROGRESS,   // Pushup started
+    CYCLE_DESCENDING,    // Going down
+    CYCLE_AT_BOTTOM,     // At bottom
+    CYCLE_ASCENDING      // Coming back up
+};
+
+struct PredictionRecord {
+    uint8_t posture_class;    // 0-3 (good-form, hips-high, hips-sagging, partial-rom)
+    uint8_t phase_class;      // 0-2 (at-top, moving, at-bottom)
+    uint32_t timestamp_ms;    // For debugging
+};
+
+constexpr int MAX_PREDICTIONS_PER_CYCLE = 6;
+
+struct PushupCycleTracker {
+    PushupCycleState cycle_state;
+    PredictionRecord predictions[MAX_PREDICTIONS_PER_CYCLE];
+    uint8_t prediction_count;
+    uint32_t cycle_start_time;
+    uint32_t cycle_end_time;
+};
+
+PushupCycleTracker cycle_tracker = {CYCLE_IDLE, {}, 0, 0, 0};
+constexpr unsigned long CYCLE_TIMEOUT_MS = 10000;  // 10 seconds
+
 // ===== NORMALIZATION PARAMETERS =====
 // Replace with values from pushup_model_metadata.json generated during training
 // These are computed from your training data: mean and std per channel
@@ -166,43 +194,68 @@ int GetBestClass(TfLiteTensor* output, int num_classes) {
     return best_class;
 }
 
-void CompleteRep() {
-    // Increment total rep counter
+int AggregatePredictions(PushupCycleTracker* tracker) {
+    // Require at least 2 predictions to aggregate
+    if (tracker->prediction_count < 2) {
+        Serial.println("WARNING: Too few predictions, using most recent");
+        return tracker->predictions[tracker->prediction_count - 1].posture_class;
+    }
+
+    // Count votes for each posture class
+    int votes[NUM_POSTURE_CLASSES] = {0, 0, 0, 0};
+
+    // Only count predictions from meaningful phases
+    for (int i = 0; i < tracker->prediction_count; i++) {
+        PredictionRecord* pred = &tracker->predictions[i];
+
+        // Filter out "at-top" predictions (less informative)
+        // Focus on "moving" and "at-bottom" predictions
+        if (pred->phase_class != 0) {  // Not at-top
+            votes[pred->posture_class]++;
+        }
+    }
+
+    // Find majority
+    int best_class = 0;
+    int max_votes = votes[0];
+    for (int i = 1; i < NUM_POSTURE_CLASSES; i++) {
+        if (votes[i] > max_votes) {
+            max_votes = votes[i];
+            best_class = i;
+        }
+    }
+
+    return best_class;
+}
+
+void CompleteRepWithAggregation(int aggregated_posture) {
     rep_counter.total_reps++;
 
-    // Classify rep based on form tracking during the rep
-    bool is_good_form = (rep_counter.good_form_count > rep_counter.poor_form_count);
+    // Classify based on AGGREGATED prediction
+    bool is_good_form = (aggregated_posture == 0);  // Class 0 = good-form
 
     if (is_good_form) {
         rep_counter.good_form_reps++;
-        // Happy buzzer: two ascending notes
-        tone(BUZZER_PIN, NOTE_C5, 100);
-        delay(100);
-        noTone(BUZZER_PIN);
-        delay(50);
-        tone(BUZZER_PIN, NOTE_E5, 100);
-        delay(100);
-        noTone(BUZZER_PIN);
     } else {
         rep_counter.poor_form_reps++;
-        // Warning buzzer: single low note
-        tone(BUZZER_PIN, NOTE_C4, 200);
-        delay(200);
-        noTone(BUZZER_PIN);
     }
+
+    // Feed watchdog to prevent timeout
+    esp_task_wdt_reset();
+
+    // Concise serial output
+    Serial.printf("REP #%d | %s (%d preds, %lums) | Total:%d Good:%d Poor:%d\n",
+                  rep_counter.total_reps,
+                  posture_labels[aggregated_posture],
+                  cycle_tracker.prediction_count,
+                  cycle_tracker.cycle_end_time - cycle_tracker.cycle_start_time,
+                  rep_counter.total_reps,
+                  rep_counter.good_form_reps,
+                  rep_counter.poor_form_reps);
 
     // Reset form counters for next rep
     rep_counter.good_form_count = 0;
     rep_counter.poor_form_count = 0;
-
-    // Serial output
-    Serial.printf("\n========== REP #%d COMPLETED ==========\n", rep_counter.total_reps);
-    Serial.printf("Form: %s\n", is_good_form ? "GOOD" : "POOR");
-    Serial.printf("Total: %d | Good: %d | Poor: %d\n",
-                  rep_counter.total_reps,
-                  rep_counter.good_form_reps,
-                  rep_counter.poor_form_reps);
-    Serial.println("======================================\n");
 }
 
 void UpdateRepCounter(int phase, int posture) {
@@ -211,6 +264,25 @@ void UpdateRepCounter(int phase, int posture) {
         rep_counter.good_form_count++;
     } else {
         rep_counter.poor_form_count++;
+    }
+
+    // Buffer prediction during cycle with overflow protection
+    if (cycle_tracker.cycle_state != CYCLE_IDLE) {
+        if (cycle_tracker.prediction_count < MAX_PREDICTIONS_PER_CYCLE) {
+            PredictionRecord* pred = &cycle_tracker.predictions[cycle_tracker.prediction_count++];
+            pred->posture_class = posture;
+            pred->phase_class = phase;
+            pred->timestamp_ms = millis();
+        } else {
+            // Buffer full - shift left to keep most recent
+            for (int i = 0; i < MAX_PREDICTIONS_PER_CYCLE - 1; i++) {
+                cycle_tracker.predictions[i] = cycle_tracker.predictions[i + 1];
+            }
+            PredictionRecord* pred = &cycle_tracker.predictions[MAX_PREDICTIONS_PER_CYCLE - 1];
+            pred->posture_class = posture;
+            pred->phase_class = phase;
+            pred->timestamp_ms = millis();
+        }
     }
 
     // State transitions with hysteresis
@@ -229,6 +301,11 @@ void UpdateRepCounter(int phase, int posture) {
                 if (rep_counter.phase_confirm_count >= 2) {
                     rep_counter.state = STATE_DESCENDING;
                     rep_counter.phase_confirm_count = 0;
+
+                    // Start cycle tracking
+                    cycle_tracker.cycle_state = CYCLE_IN_PROGRESS;
+                    cycle_tracker.prediction_count = 0;
+                    cycle_tracker.cycle_start_time = millis();
                 }
             } else {
                 rep_counter.phase_confirm_count = 0;
@@ -241,10 +318,6 @@ void UpdateRepCounter(int phase, int posture) {
                 if (rep_counter.phase_confirm_count >= 2) {
                     rep_counter.state = STATE_AT_BOTTOM;
                     rep_counter.phase_confirm_count = 0;
-                    // Quick beep at bottom
-                    tone(BUZZER_PIN, NOTE_D4, 50);
-                    delay(50);
-                    noTone(BUZZER_PIN);
                 }
             } else {
                 rep_counter.phase_confirm_count = 0;
@@ -267,7 +340,17 @@ void UpdateRepCounter(int phase, int posture) {
             if (phase == 0) {  // at-top
                 rep_counter.phase_confirm_count++;
                 if (rep_counter.phase_confirm_count >= 2) {
-                    CompleteRep();  // REP COMPLETED!
+                    // End cycle and aggregate
+                    cycle_tracker.cycle_end_time = millis();
+                    int final_posture = AggregatePredictions(&cycle_tracker);
+
+                    // Complete rep with aggregated prediction
+                    CompleteRepWithAggregation(final_posture);
+
+                    // Reset cycle tracker
+                    cycle_tracker.cycle_state = CYCLE_IDLE;
+                    cycle_tracker.prediction_count = 0;
+
                     rep_counter.state = STATE_AT_TOP;
                     rep_counter.phase_confirm_count = 0;
                 }
@@ -278,12 +361,104 @@ void UpdateRepCounter(int phase, int posture) {
     }
 
     // Track state entry time for timeout detection
+    // Update cycle state based on pushup state
     if (rep_counter.state != old_state) {
         rep_counter.state_enter_time = millis();
+
+        // Print state transition
+        const char* state_names[] = {"IDLE", "AT_TOP", "DESCENDING", "AT_BOTTOM", "ASCENDING"};
+        Serial.printf("State: %s -> %s | Reps: %d\n",
+                     state_names[old_state],
+                     state_names[rep_counter.state],
+                     rep_counter.total_reps);
+
+        switch (rep_counter.state) {
+            case STATE_DESCENDING:
+                cycle_tracker.cycle_state = CYCLE_DESCENDING;
+                break;
+            case STATE_AT_BOTTOM:
+                cycle_tracker.cycle_state = CYCLE_AT_BOTTOM;
+                break;
+            case STATE_ASCENDING:
+                cycle_tracker.cycle_state = CYCLE_ASCENDING;
+                break;
+            default:
+                break;
+        }
     }
 }
 
+// Statistical phase detection based on Z-acceleration patterns
+int DetectPhase() {
+    // Phase detection thresholds (from auto_label_phases.py)
+    const float VALLEY_MAX = 0.70f;      // Moving phase (low az)
+    const float PLATEAU_MIN = 0.72f;     // Top plateau
+    const float PLATEAU_MAX = 1.10f;     // Top plateau
+    const float PEAK_MIN = 1.12f;        // Bottom peak (high az)
+    const float STABLE_STD_MAX = 0.10f;  // Low variance = stable
+    const float STATIC_GY_MAX = 15.0f;   // Low gyro = static
+
+    // Calculate statistics from current window
+    float az_sum = 0.0f;
+    float gy_sum = 0.0f;
+
+    for (int i = 0; i < WINDOW_SIZE; i++) {
+        int buf_idx = (buffer_index - WINDOW_SIZE + i + BUFFER_SIZE) % BUFFER_SIZE;
+        az_sum += imu_buffer[buf_idx][2];  // az is channel 2
+        gy_sum += fabsf(imu_buffer[buf_idx][4]);  // |gy| is channel 4
+    }
+
+    float az_mean = az_sum / WINDOW_SIZE;
+    float gy_max_abs = gy_sum / WINDOW_SIZE;  // Approximation
+
+    // Calculate variance for az
+    float az_var_sum = 0.0f;
+    for (int i = 0; i < WINDOW_SIZE; i++) {
+        int buf_idx = (buffer_index - WINDOW_SIZE + i + BUFFER_SIZE) % BUFFER_SIZE;
+        float diff = imu_buffer[buf_idx][2] - az_mean;
+        az_var_sum += diff * diff;
+    }
+    float az_std = sqrtf(az_var_sum / WINDOW_SIZE);
+
+    // Phase detection logic (from Python auto_label_phase)
+    // RULE 1: Clear valley = moving
+    if (az_mean < VALLEY_MAX) {
+        return 1;  // moving
+    }
+
+    // RULE 2: Clear peak = at-bottom
+    if (az_mean >= PEAK_MIN) {
+        return 2;  // at-bottom
+    }
+
+    // RULE 3: High gyro activity = moving
+    if (gy_max_abs > 20.0f) {
+        return 1;  // moving
+    }
+
+    // RULE 4: Stable plateau = at-top
+    if (az_mean >= PLATEAU_MIN && az_mean <= PLATEAU_MAX &&
+        az_std < STABLE_STD_MAX && gy_max_abs < STATIC_GY_MAX) {
+        return 0;  // at-top
+    }
+
+    // RULE 5: High variance = moving
+    if (az_std > 0.15f) {
+        return 1;  // moving
+    }
+
+    // Default: at-top if in plateau range, otherwise moving
+    if (az_mean >= PLATEAU_MIN && az_mean <= PLATEAU_MAX) {
+        return 0;  // at-top
+    }
+
+    return 1;  // moving (default)
+}
+
 void DisplayRepCount() {
+    // Feed watchdog before display update
+    esp_task_wdt_reset();
+
     oled_display_clear();
     oled_display_text(0, 0, "PUSHUP TRACKER");
 
@@ -297,10 +472,18 @@ void DisplayRepCount() {
              rep_counter.poor_form_reps);
     oled_display_text(0, 32, form_line);
 
-    char state_line[32];
-    const char* state_names[] = {"IDLE", "TOP", "DOWN", "BOTTOM", "UP"};
-    snprintf(state_line, sizeof(state_line), "%s", state_names[rep_counter.state]);
-    oled_display_text(0, 48, state_line);
+    // Show cycle progress
+    char cycle_line[32];
+    if (cycle_tracker.cycle_state != CYCLE_IDLE) {
+        const char* cycle_names[] = {"IDLE", "ACTIVE", "DOWN", "BOTTOM", "UP"};
+        snprintf(cycle_line, sizeof(cycle_line), "%s [%d pred]",
+                 cycle_names[cycle_tracker.cycle_state],
+                 cycle_tracker.prediction_count);
+    } else {
+        const char* state_names[] = {"IDLE", "TOP", "DOWN", "BOTTOM", "UP"};
+        snprintf(cycle_line, sizeof(cycle_line), "%s", state_names[rep_counter.state]);
+    }
+    oled_display_text(0, 48, cycle_line);
 
     oled_display_update();
 }
@@ -344,13 +527,7 @@ void RunInference() {
     }
 
     // Run inference
-    Serial.println("[INFERENCE] Starting model invoke...");
-    unsigned long start_time = millis();
-
     TfLiteStatus invoke_status = interpreter->Invoke();
-
-    unsigned long inference_time = millis() - start_time;
-    Serial.printf("[INFERENCE] Completed in %lu ms\n", inference_time);
 
     if (invoke_status != kTfLiteOk) {
         Serial.println("ERROR: Inference failed!");
@@ -360,23 +537,14 @@ void RunInference() {
     // Feed watchdog again after inference
     esp_task_wdt_reset();
 
-    // Get output tensors (multi-task model with 2 outputs)
+    // Get output tensor (single-output posture model)
     TfLiteTensor* posture_output = interpreter->output(0);  // Posture: [4 classes]
-    TfLiteTensor* phase_output = interpreter->output(1);    // Phase: [3 classes]
 
-    // Get best predictions using helper function
+    // Get best posture prediction
     int best_posture = GetBestClass(posture_output, NUM_POSTURE_CLASSES);
-    int best_phase = GetBestClass(phase_output, NUM_PHASE_CLASSES);
 
-    // Print results to serial
-    Serial.println("\n========== PREDICTION ==========");
-    Serial.printf("Posture: %s\n", posture_labels[best_posture]);
-    Serial.printf("Phase: %s\n", phase_labels[best_phase]);
-    Serial.printf("State: %s\n", (rep_counter.state == STATE_IDLE ? "IDLE" :
-                                   rep_counter.state == STATE_AT_TOP ? "TOP" :
-                                   rep_counter.state == STATE_DESCENDING ? "DOWN" :
-                                   rep_counter.state == STATE_AT_BOTTOM ? "BOTTOM" : "UP"));
-    Serial.println("================================\n");
+    // Detect phase using statistical analysis of IMU data
+    int best_phase = DetectPhase();
 
     // Update state machine with predictions
     UpdateRepCounter(best_phase, best_posture);
@@ -433,7 +601,6 @@ void setup() {
 
     // Initialize button and LED
     pinMode(BUTTON_PIN, INPUT);
-    pinMode(BUZZER_PIN, OUTPUT);
     pinMode(RECORDING_LED_PIN, OUTPUT);
 
     attachInterrupt(digitalPinToInterrupt(BUTTON_PIN), handleButtonInterrupt, CHANGE);
@@ -489,6 +656,11 @@ void setup() {
     Serial.printf("Input type: %s\n",
                   input->type == kTfLiteInt8 ? "INT8" : "FLOAT32");
 
+    // Check number of outputs
+    int num_outputs = interpreter->outputs_size();
+    Serial.printf("Number of outputs: %d\n", num_outputs);
+    Serial.println("Using statistical phase detection");
+
     Serial.println("========================================");
     Serial.println("System ready!");
     Serial.println("Press button or key to START inference");
@@ -519,48 +691,25 @@ void loop() {
     if (currentState != lastButtonState) {
         lastButtonState = currentState;
         lastOLEDUpdate = millis();  // reset OLED timer
-        // Print button/LED state for debugging
-        Serial.printf("Button: %s, LED: %s\n",
-                  currentState ? "HIGH" : "LOW",
-                  currentState ? "ON" : "OFF");
 
         if (currentState == HIGH) {
             // Toggle inference state
             inferenceEnabled = !inferenceEnabled;
 
             if (inferenceEnabled) {
-                // OLED update for button pressed
+                Serial.println("Started");
                 oled_display_clear();
                 oled_display_text(0, 10, "GAINS");
-                oled_display_text(0, 30, "Started recording. Press button to stop.");
+                oled_display_text(0, 30, "Started");
                 oled_display_update();
-
-                // LED is on while recording
                 digitalWrite(RECORDING_LED_PIN, HIGH);
-
-                // Buzz tone to indicate start (two beeps)
-                tone(BUZZER_PIN, NOTE_D4, 100);
-                delay(100);
-                noTone(BUZZER_PIN);
-                delay(50);
-                tone(BUZZER_PIN, NOTE_D4, 100);
-                delay(100);
-                noTone(BUZZER_PIN);
-
             } else {
-                // OLED update for stopping recording
+                Serial.println("Stopped");
                 oled_display_clear();
                 oled_display_text(0, 10, "GAINS");
-                oled_display_text(0, 30, "Stopped Recording. Press button to start again.");
+                oled_display_text(0, 30, "Stopped");
                 oled_display_update();
-
-                // LED is off while not recording
                 digitalWrite(RECORDING_LED_PIN, LOW);
-
-                // Buzz tone to indicate stop
-                tone(BUZZER_PIN, NOTE_C4, 200);
-                delay(200);
-                noTone(BUZZER_PIN);
             }
         }
     }
@@ -568,22 +717,20 @@ void loop() {
     // Handle serial input
     if (Serial.available() > 0) {
         char key = Serial.read();
-        // Clear any remaining characters
         while (Serial.available() > 0) {
             Serial.read();
         }
-        Serial.printf("Key pressed: '%c' (0x%02X)\n", key, key);
 
         inferenceEnabled = !inferenceEnabled;
 
         oled_display_clear();
         oled_display_text(0, 10, "GAINS");
         if (inferenceEnabled) {
-            oled_display_text(0, 30, "Running...");
-            Serial.println("[INFERENCE STARTED via serial]");
+            oled_display_text(0, 30, "Running");
+            Serial.println("Started");
         } else {
             oled_display_text(0, 30, "Stopped");
-            Serial.println("[INFERENCE STOPPED via serial]");
+            Serial.println("Stopped");
         }
         oled_display_update();
         lastOLEDUpdate = millis();
@@ -614,13 +761,49 @@ void loop() {
             RunInference();
         }
 
-        // State machine timeout - reset if stuck in same state too long
+        // State machine timeout - handle stuck states
         if (rep_counter.state != STATE_IDLE &&
+            rep_counter.state != STATE_AT_TOP &&
             currentTime - rep_counter.state_enter_time > STATE_TIMEOUT_MS) {
-            Serial.println("STATE TIMEOUT - Reset to IDLE");
-            rep_counter.state = STATE_IDLE;
-            rep_counter.phase_confirm_count = 0;
+
+            // If stuck in ASCENDING state, likely finished the pushup - complete it
+            if (rep_counter.state == STATE_ASCENDING && cycle_tracker.prediction_count >= 2) {
+                Serial.println("Timeout in ASCENDING - completing rep");
+                cycle_tracker.cycle_end_time = millis();
+                int final_posture = AggregatePredictions(&cycle_tracker);
+                CompleteRepWithAggregation(final_posture);
+                cycle_tracker.cycle_state = CYCLE_IDLE;
+                cycle_tracker.prediction_count = 0;
+                rep_counter.state = STATE_AT_TOP;
+                rep_counter.phase_confirm_count = 0;
+            } else {
+                // For other stuck states, reset
+                Serial.printf("Timeout in %s - resetting\n",
+                    rep_counter.state == STATE_DESCENDING ? "DESCENDING" :
+                    rep_counter.state == STATE_AT_BOTTOM ? "AT_BOTTOM" : "UNKNOWN");
+                rep_counter.state = STATE_IDLE;
+                rep_counter.phase_confirm_count = 0;
+                cycle_tracker.cycle_state = CYCLE_IDLE;
+                cycle_tracker.prediction_count = 0;
+            }
             rep_counter.state_enter_time = currentTime;
+        }
+
+        // Check for cycle timeout (incomplete pushup)
+        if (cycle_tracker.cycle_state != CYCLE_IDLE) {
+            unsigned long cycle_duration = currentTime - cycle_tracker.cycle_start_time;
+
+            if (cycle_duration > CYCLE_TIMEOUT_MS) {
+                Serial.println("CYCLE TIMEOUT - Resetting");
+
+                // Reset cycle without counting rep
+                cycle_tracker.cycle_state = CYCLE_IDLE;
+                cycle_tracker.prediction_count = 0;
+                rep_counter.state = STATE_IDLE;
+                rep_counter.phase_confirm_count = 0;
+                rep_counter.good_form_count = 0;
+                rep_counter.poor_form_count = 0;
+            }
         }
     }
 
