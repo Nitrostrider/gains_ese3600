@@ -69,19 +69,21 @@ const char* posture_labels[NUM_POSTURE_CLASSES] = {
 // Replace with values from pushup_model_metadata.json generated during training
 // These are computed from your training data: mean and std per channel
 float imu_mean[NUM_CHANNELS] = {
-    0.21002981838521975,
-    -0.012597600868383742,
-    0.9683456599734906,
-    0.17634020483573734,
-    1.1392008499625985,
-    0.9496813799078279
+    -0.03174479370222903,
+    0.02083979928059304,
+    0.05792057603240711,
+    0.1052310573344205,
+    -0.03286612963703208,
+    0.2116171041436743
 };
-float imu_std[NUM_CHANNELS] = {0.2788689179258505,
-    0.11287905247385777,
-    0.28730744260394775,
-    13.642031321723314,
-    36.710716288881166,
-    6.244813331362449};
+float imu_std[NUM_CHANNELS] = {
+    1.0673020584149846,
+    1.2686258343537973,
+    0.9577753765159384,
+    1.6080057213009575,
+    1.0319275489815067,
+    1.4620289630621623
+};
 
 // ===== IMU BUFFER =====
 // Circular buffer for sliding window
