@@ -115,15 +115,15 @@ bool SetupIMU() {
     }
     vTaskDelay(pdMS_TO_TICKS(10));
     
-    // Configure accelerometer: ±4g range
-    ret = i2c_write_byte(kIMU_Address, ICM20600_Regs::ACCEL_CONFIG, 0x08);
+    // Configure accelerometer: ±2g range (matches training data!)
+    ret = i2c_write_byte(kIMU_Address, ICM20600_Regs::ACCEL_CONFIG, 0x00);
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "Failed to configure accelerometer");
         return false;
     }
-    
-    // Configure gyroscope: ±500 deg/s range
-    ret = i2c_write_byte(kIMU_Address, ICM20600_Regs::GYRO_CONFIG, 0x08);
+
+    // Configure gyroscope: ±250 deg/s range (matches training data!)
+    ret = i2c_write_byte(kIMU_Address, ICM20600_Regs::GYRO_CONFIG, 0x00);
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "Failed to configure gyroscope");
         return false;
@@ -165,14 +165,14 @@ bool ReadIMU(float* accel_data, float* gyro_data) {
     int16_t gyro_z = (int16_t)((raw_data[12] << 8) | raw_data[13]);
     
     // Convert to physical units
-    // Accelerometer: ±4g range -> 8192 LSB/g
-    constexpr float accel_scale = 4.0f / 32768.0f;
+    // Accelerometer: ±2g range -> 16384 LSB/g (matches training data!)
+    constexpr float accel_scale = 2.0f / 32768.0f;
     accel_data[0] = accel_x * accel_scale;
     accel_data[1] = accel_y * accel_scale;
     accel_data[2] = accel_z * accel_scale;
-    
-    // Gyroscope: ±500 deg/s range -> 65.5 LSB/(deg/s)
-    constexpr float gyro_scale = 500.0f / 32768.0f;
+
+    // Gyroscope: ±250 deg/s range -> 131 LSB/(deg/s) (matches training data!)
+    constexpr float gyro_scale = 250.0f / 32768.0f;
     gyro_data[0] = gyro_x * gyro_scale;
     gyro_data[1] = gyro_y * gyro_scale;
     gyro_data[2] = gyro_z * gyro_scale;

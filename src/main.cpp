@@ -19,6 +19,7 @@
 
 #include "imu_provider.h"
 #include "pushup_model_data.h"
+#include "preprocessing.h"
 
 // Note definitions for the speaker
 #define NOTE_C4 262
@@ -102,6 +103,9 @@ tflite::MicroInterpreter* interpreter = nullptr;
 // ===== INFERENCE CONTROL =====
 constexpr int INFERENCE_INTERVAL_MS = 1000;  // Run inference every 1 second when enabled
 unsigned long lastInferenceTime = 0;
+
+// ===== PREPROCESSING =====
+Preprocessor preprocessor;  // Global preprocessor instance for filtering pipeline
 
 // ===== HELPER FUNCTIONS =====
 
@@ -289,6 +293,10 @@ void setup() {
     }
     Serial.println("✓ IMU ready");
 
+    // Initialize preprocessing pipeline
+    preprocessor.Init();
+    Serial.println("✓ Preprocessing filters initialized");
+
     // Load TFLite model
     model = tflite::GetModel(g_pushup_model_data);
     if (model->version() != TFLITE_SCHEMA_VERSION) {
@@ -352,6 +360,16 @@ void setup() {
 // loop()
 // ====================================================================
 void loop() {
+    // Timing diagnostics: Track loop duration
+    static unsigned long last_loop_time = 0;
+    unsigned long loop_start = millis();
+    unsigned long loop_duration = loop_start - last_loop_time;
+
+    // Warn if loop is taking too long (> 100ms indicates blocking)
+    if (last_loop_time > 0 && loop_duration > 100) {
+        Serial.printf("[TIMING WARNING] Loop took %lu ms (expected ~10ms)\n", loop_duration);
+    }
+
     // Handle button state changes
     bool currentState = buttonState;
 
@@ -430,19 +448,40 @@ void loop() {
     }
 
     // Always read IMU data (keep buffer updated)
-    float accel[3], gyro[3];
-    if (ReadIMU(accel, gyro)) {
-        // Store in circular buffer: [ax, ay, az, gx, gy, gz]
-        imu_buffer[buffer_index][0] = accel[0];
-        imu_buffer[buffer_index][1] = accel[1];
-        imu_buffer[buffer_index][2] = accel[2];
-        imu_buffer[buffer_index][3] = gyro[0];
-        imu_buffer[buffer_index][4] = gyro[1];
-        imu_buffer[buffer_index][5] = gyro[2];
+    float raw_accel[3], raw_gyro[3];
+    if (ReadIMU(raw_accel, raw_gyro)) {
+        // Apply preprocessing pipeline:
+        // 1. Median filter (denoise)
+        // 2. Lowpass filter on accel (10 Hz)
+        // 3. Highpass filter on gyro (0.2 Hz)
+        // 4. Gravity removal from accel (0.5 Hz lowpass estimate)
+        float processed_sample[NUM_CHANNELS];
+        preprocessor.ProcessSample(raw_accel, raw_gyro, processed_sample);
+
+        // Store preprocessed data in circular buffer: [ax, ay, az, gx, gy, gz]
+        // This data is now: linear accel (no gravity) + drift-free gyro
+        imu_buffer[buffer_index][0] = processed_sample[0];
+        imu_buffer[buffer_index][1] = processed_sample[1];
+        imu_buffer[buffer_index][2] = processed_sample[2];
+        imu_buffer[buffer_index][3] = processed_sample[3];
+        imu_buffer[buffer_index][4] = processed_sample[4];
+        imu_buffer[buffer_index][5] = processed_sample[5];
 
         buffer_index = (buffer_index + 1) % BUFFER_SIZE;
         if (samples_collected < WINDOW_SIZE) {
             samples_collected++;
+        }
+
+        // Debug: Print raw vs processed data every 20 samples (every 0.5 seconds @ 40Hz)
+        static int debug_count = 0;
+        if (samples_collected >= WINDOW_SIZE && (++debug_count % 20 == 0)) {
+            Serial.printf("[RAW] ax=%.3f, ay=%.3f, az=%.3f | gx=%.3f, gy=%.3f, gz=%.3f\n",
+                          raw_accel[0], raw_accel[1], raw_accel[2],
+                          raw_gyro[0], raw_gyro[1], raw_gyro[2]);
+            Serial.printf("[PROCESSED] ax=%.3f, ay=%.3f, az=%.3f | gx=%.3f, gy=%.3f, gz=%.3f\n",
+                          processed_sample[0], processed_sample[1], processed_sample[2],
+                          processed_sample[3], processed_sample[4], processed_sample[5]);
+            Serial.println();
         }
     }
 
@@ -455,5 +494,12 @@ void loop() {
         }
     }
 
+    // Feed watchdog in main loop to prevent timeout when inference is disabled
+    // or during buffer warmup period (first 50 samples)
+    esp_task_wdt_reset();
+
     delay(10);  // ~100 Hz sampling rate
+
+    // Update timing for next iteration
+    last_loop_time = millis();
 }
