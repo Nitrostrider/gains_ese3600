@@ -19,6 +19,7 @@
 
 #include "imu_provider.h"
 #include "pushup_model_data.h"
+#include "preprocessing.h"
 
 // Note definitions for the speaker
 #define NOTE_C4 262
@@ -41,7 +42,6 @@ const int RECORDING_LED_PIN = 4;  // LED pin
 // LOW = false; HIGH = true
 volatile bool buttonState = LOW;     // updated in ISR
 bool lastButtonState = LOW;          // tracks last state for change detection
-bool inferenceEnabled = false;        // recording state (aka inferenceEnabled)
 unsigned long lastOLEDUpdate = 0;    // timestamp for OLED throttling
 const unsigned long OLED_UPDATE_INTERVAL = 200; // ms
 
@@ -65,24 +65,51 @@ const char* posture_labels[NUM_POSTURE_CLASSES] = {
     "partial-rom"   // Class 3
 };
 
+// ===== INFERENCE RESULT STORAGE =====
+// Structure to store individual inference results for voting
+struct InferenceResult {
+    float probabilities[NUM_POSTURE_CLASSES];  // All 4 class probabilities
+    float max_confidence;                       // Best class confidence
+    int best_class;                             // Best class index
+    unsigned long timestamp;                    // When inference ran
+};
+
+constexpr int MAX_INFERENCE_RESULTS = 15;  // Support pushups up to 15s
+InferenceResult inference_buffer[MAX_INFERENCE_RESULTS];
+int inference_count = 0;
+
+// ===== RECORDING STATE MACHINE =====
+// Enhanced state machine (replaces simple bool inferenceEnabled)
+enum RecordingState {
+    IDLE,              // Ready to start
+    RECORDING,         // Collecting inferences
+    DISPLAYING_RESULT  // Showing voted result
+};
+RecordingState recording_state = IDLE;
+
+// Final voted result storage
+int final_voted_class = 0;
+float final_voted_confidence = 0.0f;
+int final_sample_count = 0;
+
 // ===== NORMALIZATION PARAMETERS =====
 // Replace with values from pushup_model_metadata.json generated during training
 // These are computed from your training data: mean and std per channel
 float imu_mean[NUM_CHANNELS] = {
-    -0.03174479370222903,
-    0.02083979928059304,
-    0.05792057603240711,
-    0.1052310573344205,
-    -0.03286612963703208,
-    0.2116171041436743
+    0.00042208,
+    -0.00188804,
+    -0.00668184,
+    -0.73875794,
+    1.9212489,
+    -0.94398156
 };
 float imu_std[NUM_CHANNELS] = {
-    1.0673020584149846,
-    1.2686258343537973,
-    0.9577753765159384,
-    1.6080057213009575,
-    1.0319275489815067,
-    1.4620289630621623
+    0.09626791,
+    0.04948182,
+    0.20323046,
+    7.33304658,
+    27.609867,
+    5.87350077
 };
 
 // ===== IMU BUFFER =====
@@ -100,10 +127,212 @@ const tflite::Model* model = nullptr;
 tflite::MicroInterpreter* interpreter = nullptr;
 
 // ===== INFERENCE CONTROL =====
-constexpr int INFERENCE_INTERVAL_MS = 1000;  // Run inference every 1 second when enabled
+constexpr int INFERENCE_INTERVAL_MS = 200;  // Run inference every  second when enabled
 unsigned long lastInferenceTime = 0;
 
+// ===== PREPROCESSING =====
+Preprocessor preprocessor;  // Global preprocessor instance for filtering pipeline
+
 // ===== HELPER FUNCTIONS =====
+
+// Clear inference buffer when starting new recording
+void ClearInferenceBuffer() {
+    inference_count = 0;
+    memset(inference_buffer, 0, sizeof(inference_buffer));
+    Serial.println("[BUFFER] Inference buffer cleared");
+}
+
+// Store inference result in buffer
+void StoreInferenceResult(const float* probs, int best, float max_prob) {
+    if (inference_count >= MAX_INFERENCE_RESULTS) {
+        Serial.println("[BUFFER WARNING] Maximum inferences reached (15)");
+        return;
+    }
+
+    InferenceResult* result = &inference_buffer[inference_count];
+    memcpy(result->probabilities, probs, sizeof(float) * NUM_POSTURE_CLASSES);
+    result->max_confidence = max_prob;
+    result->best_class = best;
+    result->timestamp = millis();
+
+    inference_count++;
+    Serial.printf("[BUFFER] Stored inference #%d (class=%s, conf=%.1f%%)\n",
+                  inference_count, posture_labels[best], max_prob * 100);
+}
+
+// Compute confidence-weighted vote across all stored inferences
+bool ComputeWeightedVote(int& voted_class, float& voted_confidence) {
+    const int MIN_SAMPLES = 2;
+
+    if (inference_count < MIN_SAMPLES) {
+        Serial.printf("[VOTE ERROR] Insufficient samples: %d (need %d)\n",
+                      inference_count, MIN_SAMPLES);
+        return false;
+    }
+
+    float weighted_scores[NUM_POSTURE_CLASSES] = {0};
+    float total_weight = 0;
+
+    // Compute weighted scores
+    for (int i = 0; i < inference_count; i++) {
+        float weight = inference_buffer[i].max_confidence;
+        total_weight += weight;
+
+        for (int c = 0; c < NUM_POSTURE_CLASSES; c++) {
+            weighted_scores[c] += inference_buffer[i].probabilities[c] * weight;
+        }
+    }
+
+    // Normalize and find winner
+    // voted_class = 0;
+    // voted_confidence = 0;
+    // for (int c = 0; c < NUM_POSTURE_CLASSES; c++) {
+    //     weighted_scores[c] /= total_weight;
+    //     if (weighted_scores[c] > voted_confidence) {
+    //         voted_confidence = weighted_scores[c];
+    //         voted_class = c;
+    //     }
+    // }
+
+    const InferenceResult& last = inference_buffer[inference_count - 1];
+
+    voted_class = last.best_class;
+    voted_confidence = last.max_confidence;
+
+    // Debug output
+    Serial.println("\n========== WEIGHTED VOTE ==========");
+    Serial.printf("Samples: %d\n", inference_count);
+    for (int c = 0; c < NUM_POSTURE_CLASSES; c++) {
+        Serial.printf("  %s: %.1f%%\n", posture_labels[c],
+                      weighted_scores[c] * 100);
+    }
+    Serial.printf("Winner: %s (%.1f%% confident)\n",
+                  posture_labels[voted_class], voted_confidence * 100);
+    Serial.println("===================================\n");
+
+    return true;
+}
+
+// Display recording status with sample count
+void DisplayRecordingStatus() {
+    oled_display_clear();
+    oled_display_text(0, 0, "GAINS");
+    oled_display_text(0, 16, "Recording...");
+
+    char sample_line[32];
+    snprintf(sample_line, sizeof(sample_line), "%d samples", inference_count);
+    oled_display_text(0, 32, sample_line);
+
+    oled_display_update();
+}
+
+// Display voted result with confidence
+void DisplayVotedResult(int voted_class, float voted_conf, int sample_count) {
+    oled_display_clear();
+    oled_display_text(0, 0, "GAINS");
+    oled_display_text(0, 12, "Result:");
+
+    // Posture label (may wrap to two lines)
+    oled_display_text(0, 24, posture_labels[voted_class]);
+
+    // Confidence
+    char conf_line[32];
+    snprintf(conf_line, sizeof(conf_line), "%.0f%% confident", voted_conf * 100);
+    oled_display_text(0, 36, conf_line);
+
+    // Sample count
+    char sample_line[32];
+    snprintf(sample_line, sizeof(sample_line), "(%d samples)", sample_count);
+    oled_display_text(0, 48, sample_line);
+
+    oled_display_update();
+}
+
+// Display error when insufficient samples collected
+void DisplayInsufficientSamplesError(int sample_count) {
+    oled_display_clear();
+    oled_display_text(0, 0, "GAINS");
+    oled_display_text(0, 16, "ERROR");
+    oled_display_text(0, 32, "Need 2+ samples");
+
+    char got_line[32];
+    snprintf(got_line, sizeof(got_line), "Got: %d", sample_count);
+    oled_display_text(0, 48, got_line);
+
+    oled_display_update();
+}
+
+// Handle recording state transitions (unified button/serial handler)
+void HandleRecordingToggle(bool is_button) {
+    const char* source = is_button ? "button" : "serial";
+
+    switch (recording_state) {
+        case IDLE:
+            // Start recording
+            recording_state = RECORDING;
+            ClearInferenceBuffer();
+
+            Serial.printf("[STATE] IDLE -> RECORDING (via %s)\n", source);
+
+            // Visual feedback
+            digitalWrite(RECORDING_LED_PIN, HIGH);
+            oled_display_clear();
+            oled_display_text(0, 0, "GAINS");
+            oled_display_text(0, 20, "Recording...");
+            oled_display_text(0, 40, "0 samples");
+            oled_display_update();
+
+            // Audio feedback
+            tone(BUZZER_PIN, NOTE_D4, 100);
+            delay(100);
+            noTone(BUZZER_PIN);
+            delay(50);
+            tone(BUZZER_PIN, NOTE_D4, 100);
+            delay(100);
+            noTone(BUZZER_PIN);
+            break;
+
+        case RECORDING:
+            // Stop recording and compute vote
+            recording_state = DISPLAYING_RESULT;
+
+            Serial.printf("[STATE] RECORDING -> DISPLAYING_RESULT (via %s)\n", source);
+
+            // Compute vote
+            if (ComputeWeightedVote(final_voted_class, final_voted_confidence)) {
+                final_sample_count = inference_count;
+                DisplayVotedResult(final_voted_class, final_voted_confidence,
+                                  final_sample_count);
+            } else {
+                // Insufficient samples
+                final_sample_count = inference_count;
+                DisplayInsufficientSamplesError(final_sample_count);
+            }
+
+            // Visual feedback
+            digitalWrite(RECORDING_LED_PIN, LOW);
+
+            // Audio feedback
+            tone(BUZZER_PIN, NOTE_C4, 200);
+            delay(200);
+            noTone(BUZZER_PIN);
+            break;
+
+        case DISPLAYING_RESULT:
+            // Return to idle
+            recording_state = IDLE;
+
+            Serial.printf("[STATE] DISPLAYING_RESULT -> IDLE (via %s)\n", source);
+
+            oled_display_clear();
+            oled_display_text(0, 10, "GAINS");
+            oled_display_text(0, 30, "Press to start");
+            oled_display_update();
+            break;
+    }
+
+    lastOLEDUpdate = millis();
+}
 
 void NormalizeWindow(float normalized_window[WINDOW_SIZE][NUM_CHANNELS]) {
     // Normalize the sliding window using saved mean/std
@@ -209,20 +438,18 @@ void RunInference() {
     }
     Serial.println("================================\n");
 
-    // Update OLED display with results
-    oled_display_clear();
-    oled_display_text(0, 0, "GAINS");
-    oled_display_text(0, 16, "Posture:");
+    // Store result and update display if recording
+    if (recording_state == RECORDING) {
+        // Store result in buffer
+        StoreInferenceResult(posture_probs, best_posture, max_posture_prob);
 
-    char posture_line[32];
-    snprintf(posture_line, sizeof(posture_line), "%s", posture_labels[best_posture]);
-    oled_display_text(0, 32, posture_line);
-
-    char conf_line[32];
-    snprintf(conf_line, sizeof(conf_line), "%.0f%% confident", max_posture_prob * 100);
-    oled_display_text(0, 48, conf_line);
-
-    oled_display_update();
+        // Update display with sample count (throttled)
+        unsigned long currentTime = millis();
+        if (currentTime - lastOLEDUpdate >= OLED_UPDATE_INTERVAL) {
+            DisplayRecordingStatus();
+            lastOLEDUpdate = currentTime;
+        }
+    }
 }
 
 // ====================================================================
@@ -272,9 +499,13 @@ void setup() {
     oled_display_update();
 
     // Initialize button and LED
-    pinMode(BUTTON_PIN, INPUT);
+    pinMode(BUTTON_PIN, INPUT_PULLUP);  // Enable pull-up to prevent floating pin
     pinMode(BUZZER_PIN, OUTPUT);
     pinMode(RECORDING_LED_PIN, OUTPUT);
+
+    // Read initial button state before attaching interrupt
+    buttonState = digitalRead(BUTTON_PIN);
+    lastButtonState = buttonState;
 
     attachInterrupt(digitalPinToInterrupt(BUTTON_PIN), handleButtonInterrupt, CHANGE);
 
@@ -288,6 +519,10 @@ void setup() {
         while (1) delay(1000);
     }
     Serial.println("✓ IMU ready");
+
+    // Initialize preprocessing pipeline
+    preprocessor.Init();
+    Serial.println("✓ Preprocessing filters initialized");
 
     // Load TFLite model
     model = tflite::GetModel(g_pushup_model_data);
@@ -331,13 +566,16 @@ void setup() {
 
     Serial.println("========================================");
     Serial.println("System ready!");
-    Serial.println("Press button or key to START inference");
-    Serial.println("Press again to STOP inference");
+    Serial.println("Press button or 'r' key to START recording");
+    Serial.println("Press again to STOP and get result");
+    Serial.println("Press third time to return to IDLE");
     Serial.println("========================================\n");
 
+    // Initialize state machine
+    recording_state = IDLE;
     oled_display_clear();
     oled_display_text(0, 10, "GAINS");
-    oled_display_text(0, 30, "Press button to start recording.");
+    oled_display_text(0, 30, "Press to start");
     oled_display_update();
 
     // Clear any serial data sent during connection (shell prompts, etc)
@@ -352,102 +590,88 @@ void setup() {
 // loop()
 // ====================================================================
 void loop() {
+    // Timing diagnostics: Track loop duration
+    static unsigned long last_loop_time = 0;
+    unsigned long loop_start = millis();
+    unsigned long loop_duration = loop_start - last_loop_time;
+
+    // Warn if loop is taking too long (> 100ms indicates blocking)
+    if (last_loop_time > 0 && loop_duration > 100) {
+        Serial.printf("[TIMING WARNING] Loop took %lu ms (expected ~10ms)\n", loop_duration);
+    }
+
     // Handle button state changes
     bool currentState = buttonState;
 
-    // Only update OLED if the button state has changed
     if (currentState != lastButtonState) {
         lastButtonState = currentState;
-        lastOLEDUpdate = millis();  // reset OLED timer
         // Print button/LED state for debugging
         Serial.printf("Button: %s, LED: %s\n",
                   currentState ? "HIGH" : "LOW",
                   currentState ? "ON" : "OFF");
 
         if (currentState == HIGH) {
-            // Toggle inference state
-            inferenceEnabled = !inferenceEnabled;
-
-            if (inferenceEnabled) {
-                // OLED update for button pressed
-                oled_display_clear();
-                oled_display_text(0, 10, "GAINS");
-                oled_display_text(0, 30, "Started recording. Press button to stop.");
-                oled_display_update();
-
-                // LED is on while recording
-                digitalWrite(RECORDING_LED_PIN, HIGH);
-
-                // Buzz tone to indicate start (two beeps)
-                tone(BUZZER_PIN, NOTE_D4, 100);
-                delay(100);
-                noTone(BUZZER_PIN);
-                delay(50);
-                tone(BUZZER_PIN, NOTE_D4, 100);
-                delay(100);
-                noTone(BUZZER_PIN);
-
-            } else {
-                // OLED update for stopping recording
-                oled_display_clear();
-                oled_display_text(0, 10, "GAINS");
-                oled_display_text(0, 30, "Stopped Recording. Press button to start again.");
-                oled_display_update();
-
-                // LED is off while not recording
-                digitalWrite(RECORDING_LED_PIN, LOW);
-
-                // Buzz tone to indicate stop
-                tone(BUZZER_PIN, NOTE_C4, 200);
-                delay(200);
-                noTone(BUZZER_PIN);
-            }
+            HandleRecordingToggle(true);  // true = button source
         }
     }
 
-    // Handle serial input
+    // Handle serial input - only respond to 'r' or 'R' key
     if (Serial.available() > 0) {
         char key = Serial.read();
         // Clear any remaining characters
         while (Serial.available() > 0) {
             Serial.read();
         }
-        Serial.printf("Key pressed: '%c' (0x%02X)\n", key, key);
 
-        inferenceEnabled = !inferenceEnabled;
-
-        oled_display_clear();
-        oled_display_text(0, 10, "GAINS");
-        if (inferenceEnabled) {
-            oled_display_text(0, 30, "Running...");
-            Serial.println("[INFERENCE STARTED via serial]");
+        // Only toggle recording on 'r' or 'R' key
+        if (key == 'r' || key == 'R') {
+            Serial.printf("Key pressed: '%c' (0x%02X) - toggling recording\n", key, key);
+            HandleRecordingToggle(false);  // false = serial source
         } else {
-            oled_display_text(0, 30, "Stopped");
-            Serial.println("[INFERENCE STOPPED via serial]");
+            Serial.printf("Key pressed: '%c' (0x%02X) - ignored (press 'r' to toggle)\n", key, key);
         }
-        oled_display_update();
-        lastOLEDUpdate = millis();
     }
 
     // Always read IMU data (keep buffer updated)
-    float accel[3], gyro[3];
-    if (ReadIMU(accel, gyro)) {
-        // Store in circular buffer: [ax, ay, az, gx, gy, gz]
-        imu_buffer[buffer_index][0] = accel[0];
-        imu_buffer[buffer_index][1] = accel[1];
-        imu_buffer[buffer_index][2] = accel[2];
-        imu_buffer[buffer_index][3] = gyro[0];
-        imu_buffer[buffer_index][4] = gyro[1];
-        imu_buffer[buffer_index][5] = gyro[2];
+    float raw_accel[3], raw_gyro[3];
+    if (ReadIMU(raw_accel, raw_gyro)) {
+        // Apply preprocessing pipeline:
+        // 1. Median filter (denoise)
+        // 2. Lowpass filter on accel (10 Hz)
+        // 3. Highpass filter on gyro (0.2 Hz)
+        // 4. Gravity removal from accel (0.5 Hz lowpass estimate)
+        float processed_sample[NUM_CHANNELS];
+        preprocessor.ProcessSample(raw_accel, raw_gyro, processed_sample);
+
+        // Store preprocessed data in circular buffer: [ax, ay, az, gx, gy, gz]
+        // This data is now: linear accel (no gravity) + drift-free gyro
+        imu_buffer[buffer_index][0] = processed_sample[0];
+        imu_buffer[buffer_index][1] = processed_sample[1];
+        imu_buffer[buffer_index][2] = processed_sample[2];
+        imu_buffer[buffer_index][3] = processed_sample[3];
+        imu_buffer[buffer_index][4] = processed_sample[4];
+        imu_buffer[buffer_index][5] = processed_sample[5];
 
         buffer_index = (buffer_index + 1) % BUFFER_SIZE;
         if (samples_collected < WINDOW_SIZE) {
             samples_collected++;
         }
+
+        // Debug: Print raw vs processed data every 20 samples (every 0.5 seconds @ 40Hz)
+        static int debug_count = 0;
+        // if (samples_collected >= WINDOW_SIZE && (++debug_count % 20 == 0)) {
+        //     Serial.printf("[RAW] ax=%.3f, ay=%.3f, az=%.3f | gx=%.3f, gy=%.3f, gz=%.3f\n",
+        //                   raw_accel[0], raw_accel[1], raw_accel[2],
+        //                   raw_gyro[0], raw_gyro[1], raw_gyro[2]);
+        //     Serial.printf("[PROCESSED] ax=%.3f, ay=%.3f, az=%.3f | gx=%.3f, gy=%.3f, gz=%.3f\n",
+        //                   processed_sample[0], processed_sample[1], processed_sample[2],
+        //                   processed_sample[3], processed_sample[4], processed_sample[5]);
+        //     Serial.println();
+        // }
     }
 
-    // Run inference periodically ONLY when enabled
-    if (inferenceEnabled) {
+    // Run inference periodically ONLY when recording
+    if (recording_state == RECORDING) {
         unsigned long currentTime = millis();
         if (currentTime - lastInferenceTime >= INFERENCE_INTERVAL_MS) {
             lastInferenceTime = currentTime;
@@ -455,5 +679,12 @@ void loop() {
         }
     }
 
+    // Feed watchdog in main loop to prevent timeout when inference is disabled
+    // or during buffer warmup period (first 50 samples)
+    esp_task_wdt_reset();
+
     delay(10);  // ~100 Hz sampling rate
+
+    // Update timing for next iteration
+    last_loop_time = millis();
 }
