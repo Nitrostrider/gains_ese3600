@@ -20,7 +20,7 @@ To run inference model:
 3. Flash the script in gains_ese3600 (must be done with home directory being gains_ese3600)
 
 
-
-Beeps
-Pause a bit and then do rep
-Once reach top, immediatly stop
+Steps  
+1. Beeps  
+2. Pause a bit and then do rep  
+3. Once reach top, immediatly stop  
