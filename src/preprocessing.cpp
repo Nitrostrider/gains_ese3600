@@ -62,74 +62,103 @@ void Preprocessor::Reset() {
 
 void Preprocessor::InitAccelLowpass() {
     // 4th-order Butterworth lowpass filter: 10 Hz cutoff @ 40 Hz sample rate
-    // Designed using scipy.signal.butter(4, 10, 'low', fs=40)
+    // Designed using scipy.signal.butter(4, 10, 'low', fs=40, output='sos')
     // Implemented as cascade of two 2nd-order sections (biquads)
 
-    // Normalized frequency: Wn = 10 / (40/2) = 0.5
-    // This is a relatively high cutoff (Nyquist/4)
+    // Section 1 coefficients
+    const float b0_1 = 0.0939808514f;
+    const float b1_1 = 0.187961703f;
+    const float b2_1 = 0.0939808514f;
+    const float a1_1 = 0.0f;  // Nearly zero from scipy (1.38e-16)
+    const float a2_1 = 0.0395661299f;
 
-    // Biquad coefficients (both sections are identical for Butterworth)
-    // Digital filter coefficients from bilinear transform
-    const float b0 = 0.0947916f;
-    const float b1 = 0.1895832f;
-    const float b2 = 0.0947916f;
-    const float a1 = -0.9149758f;
-    const float a2 = 0.2941422f;
+    // Section 2 coefficients
+    const float b0_2 = 1.0f;
+    const float b1_2 = 2.0f;
+    const float b2_2 = 1.0f;
+    const float a1_2 = 0.0f;  // Nearly zero from scipy (1.61e-16)
+    const float a2_2 = 0.446462692f;
 
     for (int i = 0; i < ACCEL_CHANNELS; i++) {
-        accel_lowpass[i].b0 = b0;
-        accel_lowpass[i].b1 = b1;
-        accel_lowpass[i].b2 = b2;
-        accel_lowpass[i].a1 = a1;
-        accel_lowpass[i].a2 = a2;
+        accel_lowpass[i].b0_1 = b0_1;
+        accel_lowpass[i].b1_1 = b1_1;
+        accel_lowpass[i].b2_1 = b2_1;
+        accel_lowpass[i].a1_1 = a1_1;
+        accel_lowpass[i].a2_1 = a2_1;
+
+        accel_lowpass[i].b0_2 = b0_2;
+        accel_lowpass[i].b1_2 = b1_2;
+        accel_lowpass[i].b2_2 = b2_2;
+        accel_lowpass[i].a1_2 = a1_2;
+        accel_lowpass[i].a2_2 = a2_2;
     }
 }
 
 void Preprocessor::InitGyroHighpass() {
     // 4th-order Butterworth highpass filter: 0.2 Hz cutoff @ 40 Hz sample rate
-    // Designed using scipy.signal.butter(4, 0.2, 'high', fs=40)
+    // Designed using scipy.signal.butter(4, 0.2, 'high', fs=40, output='sos')
     // Removes low-frequency drift from gyroscope
 
-    // Normalized frequency: Wn = 0.2 / (40/2) = 0.01
-    // Very low cutoff - removes DC and slow drift
+    // Section 1 coefficients
+    const float b0_1 = 0.95978223f;
+    const float b1_1 = -1.91956446f;
+    const float b2_1 = 0.95978223f;
+    const float a1_1 = -1.94263823f;
+    const float a2_1 = 0.94359728f;
 
-    // Biquad coefficients
-    const float b0 = 0.9968781f;
-    const float b1 = -1.9937562f;
-    const float b2 = 0.9968781f;
-    const float a1 = -1.9937542f;
-    const float a2 = 0.9937582f;
+    // Section 2 coefficients
+    const float b0_2 = 1.0f;
+    const float b1_2 = -2.0f;
+    const float b2_2 = 1.0f;
+    const float a1_2 = -1.97526963f;
+    const float a2_2 = 0.97624479f;
 
     for (int i = 0; i < GYRO_CHANNELS; i++) {
-        gyro_highpass[i].b0 = b0;
-        gyro_highpass[i].b1 = b1;
-        gyro_highpass[i].b2 = b2;
-        gyro_highpass[i].a1 = a1;
-        gyro_highpass[i].a2 = a2;
+        gyro_highpass[i].b0_1 = b0_1;
+        gyro_highpass[i].b1_1 = b1_1;
+        gyro_highpass[i].b2_1 = b2_1;
+        gyro_highpass[i].a1_1 = a1_1;
+        gyro_highpass[i].a2_1 = a2_1;
+
+        gyro_highpass[i].b0_2 = b0_2;
+        gyro_highpass[i].b1_2 = b1_2;
+        gyro_highpass[i].b2_2 = b2_2;
+        gyro_highpass[i].a1_2 = a1_2;
+        gyro_highpass[i].a2_2 = a2_2;
     }
 }
 
 void Preprocessor::InitGravityFilter() {
     // 4th-order Butterworth lowpass filter: 0.5 Hz cutoff @ 40 Hz sample rate
-    // Designed using scipy.signal.butter(4, 0.5, 'low', fs=40)
+    // Designed using scipy.signal.butter(4, 0.5, 'low', fs=40, output='sos')
     // Extracts gravity component from accelerometer
 
-    // Normalized frequency: Wn = 0.5 / (40/2) = 0.025
-    // Very low cutoff - extracts quasi-static gravity
+    // Section 1 coefficients
+    const float b0_1 = 2.15056874e-06f;
+    const float b1_1 = 4.30113747e-06f;
+    const float b2_1 = 2.15056874e-06f;
+    const float a1_1 = -1.85907627f;
+    const float a2_1 = 0.864824899f;
 
-    // Biquad coefficients
-    const float b0 = 0.0000152f;
-    const float b1 = 0.0000304f;
-    const float b2 = 0.0000152f;
-    const float a1 = -1.9844048f;
-    const float a2 = 0.9844656f;
+    // Section 2 coefficients
+    const float b0_2 = 1.0f;
+    const float b1_2 = 2.0f;
+    const float b2_2 = 1.0f;
+    const float a1_2 = -1.93571484f;
+    const float a2_2 = 0.94170045f;
 
     for (int i = 0; i < ACCEL_CHANNELS; i++) {
-        gravity_filter[i].b0 = b0;
-        gravity_filter[i].b1 = b1;
-        gravity_filter[i].b2 = b2;
-        gravity_filter[i].a1 = a1;
-        gravity_filter[i].a2 = a2;
+        gravity_filter[i].b0_1 = b0_1;
+        gravity_filter[i].b1_1 = b1_1;
+        gravity_filter[i].b2_1 = b2_1;
+        gravity_filter[i].a1_1 = a1_1;
+        gravity_filter[i].a2_1 = a2_1;
+
+        gravity_filter[i].b0_2 = b0_2;
+        gravity_filter[i].b1_2 = b1_2;
+        gravity_filter[i].b2_2 = b2_2;
+        gravity_filter[i].a1_2 = a1_2;
+        gravity_filter[i].a2_2 = a2_2;
     }
 }
 
@@ -177,13 +206,15 @@ float Preprocessor::ApplyBiquad(BiquadState* state, float input,
 
 float Preprocessor::ApplyButterworthFilter(ButterworthFilter* filter, float input) {
     // Apply cascade of two biquad sections for 4th-order filter
+    // Section 1 uses coefficients b0_1, b1_1, b2_1, a1_1, a2_1
     float intermediate = ApplyBiquad(&filter->section1, input,
-                                     filter->b0, filter->b1, filter->b2,
-                                     filter->a1, filter->a2);
+                                     filter->b0_1, filter->b1_1, filter->b2_1,
+                                     filter->a1_1, filter->a2_1);
 
+    // Section 2 uses coefficients b0_2, b1_2, b2_2, a1_2, a2_2
     float output = ApplyBiquad(&filter->section2, intermediate,
-                               filter->b0, filter->b1, filter->b2,
-                               filter->a1, filter->a2);
+                               filter->b0_2, filter->b1_2, filter->b2_2,
+                               filter->a1_2, filter->a2_2);
 
     return output;
 }

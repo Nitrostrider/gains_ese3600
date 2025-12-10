@@ -18,8 +18,12 @@ struct BiquadState {
 struct ButterworthFilter {
     BiquadState section1;
     BiquadState section2;
-    float b0, b1, b2;  // Numerator coefficients
-    float a1, a2;      // Denominator coefficients (a0 = 1)
+    // Section 1 coefficients
+    float b0_1, b1_1, b2_1;  // Numerator coefficients for section 1
+    float a1_1, a2_1;         // Denominator coefficients for section 1 (a0 = 1)
+    // Section 2 coefficients
+    float b0_2, b1_2, b2_2;  // Numerator coefficients for section 2
+    float a1_2, a2_2;         // Denominator coefficients for section 2 (a0 = 1)
 };
 
 // Preprocessing filters
