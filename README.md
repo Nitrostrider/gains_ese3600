@@ -1,26 +1,29 @@
 # gains_ese3600
-Classify pushup posture
+This github repository contains code for our ESE 3600 Tiny ML project, titled Gains, which is a wearable device to help the user classify their push up posture, in hopes to improve their performance.
 
-Video + IMU
-Posture + Type of Pushup
+We have uploaded our python notebook that trains and build the model onto Google Colab for convenience.  
 
-Google colab: https://colab.research.egoogle.com/drive/1_bb615_qASqIWBoNGF4A2Udvsltr4_Ne?usp=sharingI 
-To flash:
-```pio run -t upload```
+Google Colab: https://colab.research.egoogle.com/drive/1_bb615_qASqIWBoNGF4A2Udvsltr4_Ne?usp=sharingI 
+
+Easy commands to remember:
+- To flash: ```pio run -t upload```
 
 To collect training data:
-1. Flash the script in MW_DataCollection folder (must be done with home directory being MW_DataCollection in order for platformio.ini extension to be properly used)
+1. Flash the script in data_collection folder
 2. Activate a venv
-3. Run ```python pushup_data_collector.py```
+3. Run ```python pushup_data_collector.py```, which starts up a GUI
+4. Collect data, the raw data will be placed in raw_dataset folder
 
+To process the data(applying low/high pass buffers, normalization, data augmentation)
+1. Follow the steps in the data_analysis.ipynb
 
 To run inference model:
-1. Run python notebook in google colab (use GPU)
-2. Copy and paste the binary file into pushup_model_data.cpp
-3. Flash the script in gains_ese3600 (must be done with home directory being gains_ese3600)
+1. Run the model python notebook in google colab (use GPU model)
+2. Copy and paste the binary file created from the notebook into pushup_model_data.cpp
+3. Flash the script in gains_ese3600
 
-
-Steps  
-1. Beeps  
-2. Pause a bit and then do rep  
-3. Once reach top, immediatly stop  
+To actually conduct inference:
+1. Press the button on the hardware, or type r in the serial monitor, to start a recording session  
+2. Pause a bit and then do 1 pushup rep
+3. Once reach top (ie the end of the pushup), press the button or type r in the serial monitor to tend the recording session
+4. Look at serial monitor for final classification  
