@@ -3,6 +3,8 @@ This github repository contains code for our ESE 3600 Tiny ML project, titled Ga
 
 We have uploaded our python notebook that trains and build the model onto Google Colab for convenience.  
 
+Final Report: https://docs.google.com/document/d/1kXohgcP6mb6MmehOqjFfpL7uKsxaT0XsXnimC4CWX-E/edit?usp=sharing
+
 Google Colab: https://colab.research.egoogle.com/drive/1_bb615_qASqIWBoNGF4A2Udvsltr4_Ne?usp=sharingI 
 
 Easy commands to remember:
