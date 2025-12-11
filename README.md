@@ -5,6 +5,8 @@ We have uploaded our python notebook that trains and build the model onto Google
 
 Final Report: https://docs.google.com/document/d/1kXohgcP6mb6MmehOqjFfpL7uKsxaT0XsXnimC4CWX-E/edit?usp=sharing
 
+Demo Video: https://www.youtube.com/watch?v=sGeO_O7ViBE
+
 Google Colab: https://colab.research.egoogle.com/drive/1_bb615_qASqIWBoNGF4A2Udvsltr4_Ne?usp=sharingI 
 
 Easy commands to remember:
